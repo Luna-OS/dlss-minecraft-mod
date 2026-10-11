@@ -1,5 +1,6 @@
 package com.g2806.radiante.client;
 
+import com.g2806.radiante.client.compat.OpenGlMods;
 import com.g2806.radiante.client.gui.RadianteOptionsScreen;
 import com.g2806.radiante.client.render.RadianteRenderer;
 import com.g2806.radiante.platform.RadiantePlatform;
@@ -66,8 +67,16 @@ public final class RadianteClient {
     public static void onEndClientTick(Minecraft minecraft) {
         logNativeErrors();
 
+        // Iris or Nvidium installed: which of them or Radiante runs in this start, and how to switch. It replaces the
+        // "switch to Vulkan" warning below while the game is on OpenGL for them.
+        if (minecraft.gui.screen() instanceof net.minecraft.client.gui.screens.TitleScreen title
+            && com.g2806.radiante.client.gui.GraphicsModeScreen.shouldShow()) {
+            minecraft.gui.setScreen(new com.g2806.radiante.client.gui.GraphicsModeScreen(title));
+            return;
+        }
+        boolean openGlForOtherMods = OpenGlMods.anyInstalled() && !OpenGlMods.runningOnVulkan();
         // The warning has to wait for a screen to exist, so it goes up on the first menu after startup.
-        if (!RadianteRenderer.isActive()
+        if (!RadianteRenderer.isActive() && !openGlForOtherMods
             && minecraft.gui.screen() instanceof net.minecraft.client.gui.screens.TitleScreen title
             && com.g2806.radiante.client.gui.UnsupportedHardwareScreen.shouldShow()) {
             minecraft.gui.setScreen(new com.g2806.radiante.client.gui.UnsupportedHardwareScreen(title));
@@ -105,7 +114,9 @@ public final class RadianteClient {
 
         while (RadianteKeys.OPEN_SETTINGS.consumeClick()) {
             if (minecraft.gui.screen() == null && !RadianteKeys.OPEN_SETTINGS.isUnbound()) {
-                minecraft.gui.setScreen(new RadianteOptionsScreen(null, minecraft.options));
+                // On OpenGL for Iris or Nvidium there are no ray tracing settings; the key offers the switch instead.
+                minecraft.gui.setScreen(openGlForOtherMods ? new com.g2806.radiante.client.gui.GraphicsModeScreen(null)
+                    : new RadianteOptionsScreen(null, minecraft.options));
             }
         }
 
