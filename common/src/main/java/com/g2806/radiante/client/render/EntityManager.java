@@ -45,6 +45,20 @@ public final class EntityManager {
     private static double vrHandsY;
     private static double vrHandsZ;
     private static final PoseStack POSE_STACK = new PoseStack();
+
+    /**
+     * Back to one identity pose. Every entity, block entity and hand is submitted on the one shared stack, and a
+     * renderer that throws between its pushPose and popPose (the submits below catch that and go on) leaves its
+     * poses behind: setting the top pose to identity hid it, but the stack kept growing for as long as that renderer
+     * kept failing, and later renderers ran on top of the leftovers. Mods that replace entity renderers or models
+     * (EMF, ETF, 3D Skin Layers) are where such failures come from when they meet Radiante's collector.
+     */
+    private static void resetPoseStack() {
+        while (!POSE_STACK.isEmpty()) {
+            POSE_STACK.popPose();
+        }
+        POSE_STACK.setIdentity();
+    }
     static final List<PendingEntity> PENDING = new ArrayList<>();
     private static boolean queued;
     private static int DEBUG_BLOCK_ENTITIES;
@@ -212,7 +226,7 @@ public final class EntityManager {
         }
 
         COLLECTOR.reset();
-        POSE_STACK.setIdentity();
+        resetPoseStack();
 
         // A glow item frame is lit from within in vanilla rather than by the world around it, and nothing in its
         // model says so; the entity does.
@@ -259,7 +273,7 @@ public final class EntityManager {
             // world.rgen look for; they draw the rim wherever a pixel misses the copy but a neighbour hits it.
             COLLECTOR.reset();
             COLLECTOR.colorOverride(state.outlineColor & 0xFFFFFF | 0x010101);
-            POSE_STACK.setIdentity();
+            resetPoseStack();
             try {
                 minecraft.getEntityRenderDispatcher().submit(state, cameraState, 0.0, 0.0, 0.0, POSE_STACK, COLLECTOR);
             } catch (RuntimeException e) {
@@ -432,7 +446,7 @@ public final class EntityManager {
     private static void collectBlockEntity(Minecraft minecraft, CameraRenderState cameraState,
         BlockEntityRenderState state) {
         COLLECTOR.reset();
-        POSE_STACK.setIdentity();
+        resetPoseStack();
 
         try {
             minecraft.getBlockEntityRenderDispatcher().submit(state, POSE_STACK, COLLECTOR, cameraState);
@@ -492,7 +506,7 @@ public final class EntityManager {
 
             BlockPos pos = state.blockPos();
             COLLECTOR.reset();
-            POSE_STACK.setIdentity();
+            resetPoseStack();
             POSE_STACK.translate(state.blockState().getOffset(pos));
             net.minecraft.client.renderer.block.dispatch.BlockStateModel model =
                 minecraft.getModelManager().getBlockStateModelSet().get(state.blockState());
@@ -845,7 +859,7 @@ public final class EntityManager {
 
         EntityRenderState state = playerState.avatarRenderState;
         COLLECTOR.reset();
-        POSE_STACK.setIdentity();
+        resetPoseStack();
 
         try {
             minecraft.getEntityRenderDispatcher().submit(state, cameraState, 0.0, 0.0, 0.0, POSE_STACK, COLLECTOR);
@@ -903,7 +917,7 @@ public final class EntityManager {
         }
 
         COLLECTOR.reset();
-        POSE_STACK.setIdentity();
+        resetPoseStack();
         // Minecraft poses the hands in its view space; rotate them into world orientation around the camera.
         POSE_STACK.mulPose(new Matrix4f(cameraState.viewRotationMatrix).invert());
         COLLECTOR.held(true);
