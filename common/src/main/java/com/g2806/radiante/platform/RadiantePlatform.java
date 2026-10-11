@@ -19,6 +19,14 @@ public interface RadiantePlatform {
     Path gameDir();
 
     /**
+     * Whether a mod with this ID is installed. Only the Fabric build answers; the other loaders say no, which keeps
+     * them as upstream (the OpenGL-only mods this is asked about, Iris and Nvidium, are Fabric mods anyway).
+     */
+    default boolean isModLoaded(String modId) {
+        return false;
+    }
+
+    /**
      * The collector entity and block submissions are expanded into. A loader that adds submission methods of its
      * own (Fabric's rendering API submits meshes) returns a subclass that handles them.
      */

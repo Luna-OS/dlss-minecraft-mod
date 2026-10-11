@@ -18,6 +18,11 @@ public final class FabricPlatform implements RadiantePlatform {
     }
 
     @Override
+    public boolean isModLoaded(String modId) {
+        return FabricLoader.getInstance().isModLoaded(modId);
+    }
+
+    @Override
     public EntityCollector createEntityCollector() {
         return new FabricEntityCollector();
     }

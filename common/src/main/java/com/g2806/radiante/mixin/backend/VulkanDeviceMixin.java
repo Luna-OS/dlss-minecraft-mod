@@ -1,5 +1,6 @@
 package com.g2806.radiante.mixin.backend;
 
+import com.g2806.radiante.client.compat.OpenGlMods;
 import com.g2806.radiante.client.render.RadianteRenderer;
 import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 import org.spongepowered.asm.mixin.Mixin;
@@ -12,6 +13,7 @@ public class VulkanDeviceMixin {
 
     @Inject(method = "<init>", at = @At("TAIL"))
     private void radiante$initRenderer(CallbackInfo ci) {
+        OpenGlMods.onVulkanDeviceCreated();
         RadianteRenderer.onDeviceCreated((VulkanDevice) (Object) this);
     }
 
