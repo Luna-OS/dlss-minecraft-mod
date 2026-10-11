@@ -1,0 +1,1395 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "common/shared.hpp"
+#include "util/disney.glsl"
+#include "util/alpha_mode.glsl"
+#include "common/fft_water.glsl"
+#include "util/height_map.glsl"
+#include "util/random.glsl"
+#include "util/ray_cone.glsl"
+#include "util/ray.glsl"
+#include "util/sampling_helpers.glsl"
+#include "util/util.glsl"
+
+layout(set = 0, binding = 0) uniform sampler2D textures[];
+
+layout(set = 1, binding = 0) uniform accelerationStructureEXT topLevelAS;
+
+layout(set = 1, binding = 1) readonly buffer BLASOffsets {
+    uint offsets[];
+}
+blasOffsets;
+
+layout(set = 1, binding = 2) readonly buffer IndexBufferAddr {
+    uint64_t addrs[];
+}
+indexBufferAddrs;
+
+layout(set = 1, binding = 3) readonly buffer LastIndexBufferAddr {
+    uint64_t addrs[];
+}
+lastIndexBufferAddrs;
+
+layout(set = 1, binding = 8) readonly buffer LastObjToWorldMat {
+    mat4 mat[];
+}
+lastObjToWorldMats;
+
+layout(set = 1, binding = 7) readonly buffer TextureMappingBuffer {
+    TextureMapping mapping;
+};
+
+layout(set = 1, binding = 6) readonly buffer LastPositionBufferAddr {
+    uint64_t addrs[];
+}
+lastPositionBufferAddrs;
+
+layout(set = 2, binding = 0) uniform WorldUniform {
+    WorldUBO worldUBO;
+};
+
+layout(set = 2, binding = 2) uniform SkyUniform {
+    SkyUBO skyUBO;
+};
+
+#include "common/celestial.glsl"
+
+layout(set = 5, binding = 0) uniform sampler2D transLUT;
+layout(set = 5, binding = 2) uniform samplerCube skyFull;
+
+#include "common/volumetric_cloud.glsl"
+
+layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer IndexBuffer {
+    uint indices[];
+}
+indexBuffer;
+
+#include "util/vertex.glsl"
+#include "common/constants.glsl"
+#include "common/water_medium.glsl"
+#include "common/rain_wetness.glsl"
+#include "common/seamless_glass.glsl"
+#include "common/bedrock_water.glsl"
+
+#ifndef VPT_BOUNCE_LIGHT_BOOST
+#    define VPT_BOUNCE_LIGHT_BOOST 1.0
+#endif
+
+layout(location = 0) rayPayloadInEXT MainRay mainRay;
+layout(location = 1) rayPayloadEXT ShadowRay shadowRay;
+hitAttributeEXT vec2 attribs;
+
+struct SampledSurface {
+    vec2 uv;
+    float depth;
+    bool edgeWall;
+    vec3 worldPos;
+    vec3 geometricNormal;
+    vec3 shadingNormal;
+    vec4 albedoValue;
+    vec4 specularValue;
+    vec4 normalValue;
+    vec3 tint;
+    LabPBRMat mat;
+};
+
+vec3 applyNormalMapToBasis(vec3 matNormal,
+                           vec3 tangent,
+                           vec3 bitangent,
+                           vec3 geometricNormal,
+                           vec3 viewDir) {
+    if (any(isnan(matNormal))) { return geometricNormal; }
+
+    vec3 correctedLocalNormal = matNormal;
+    correctedLocalNormal.y = -correctedLocalNormal.y;
+
+    vec3 normal = normalizeF(tangent * correctedLocalNormal.x + bitangent * correctedLocalNormal.y +
+                                 geometricNormal * correctedLocalNormal.z,
+                             geometricNormal);
+    float NdotV = dot(normal, viewDir);
+    if (NdotV >= 0.99999) { return normal; }
+
+    vec3 edgeNormal = normal - viewDir * NdotV;
+    float edgeNormalLen2 = dot(edgeNormal, edgeNormal);
+    if (edgeNormalLen2 <= 1e-10) { return geometricNormal; }
+
+    float weight = 1.0 - NdotV;
+    weight = sin(min(weight, PI * 0.5));
+    weight = clamp(min(max(NdotV, dot(viewDir, geometricNormal)), 1.0 - weight), 0.0, 1.0);
+
+    float tangentWeight2 = max(1.0 - weight * weight, 0.0);
+    if (tangentWeight2 <= 1e-10) { return geometricNormal; }
+
+    return viewDir * weight + edgeNormal * inversesqrt(edgeNormalLen2 / tangentWeight2);
+}
+
+/** The hit being shaded is glass or a glass pane (set by main from the vertex flag). */
+bool g_hitIsGlass = false;
+
+#ifndef VPT_GLASS_REFLECTION
+#    define VPT_GLASS_REFLECTION 1.0
+#endif
+
+void sampleSurfaceState(bool useTexture,
+                        uint textureID,
+                        TextureMapEntry textureMap,
+                        vec2 atlasUvMin,
+                        vec2 atlasUvMax,
+                        vec2 uv,
+                        float lod,
+                        uint alphaMode,
+                        vec4 colorLayerValue,
+                        vec3 colorLayer,
+                        vec3 glint,
+                        bool useOverlay,
+                        ivec2 overlayUV,
+                        vec3 dPduWorld,
+                        vec3 dPdvWorld,
+                        vec3 baseGeoNormal,
+                        bool hasHeightMap,
+                        float maxDepthWorld,
+                        HeightMapHit localHit,
+                        vec3 worldPos,
+                        vec3 viewDir,
+                        bool isWaterMaterial,
+                        bool isFftWaterSurface,
+                        out SampledSurface surface) {
+    vec4 albedoValue = vec4(1.0);
+    vec4 specularValue = vec4(0.0);
+    vec4 normalValue = vec4(0.0);
+    bool useFlatEdgeBand = false;
+
+    if (useTexture) {
+        albedoValue = sampleTexture(textures[nonuniformEXT(textureID)], uv, lod, false);
+        albedoValue.a = resolveSurfaceAlpha(albedoValue.a * colorLayerValue.a, alphaMode);
+        specularValue = textureMap.specular >= 0 ?
+                            sampleTexture(textures[nonuniformEXT(textureMap.specular)], uv, lod, false) :
+                            vec4(0.0);
+        normalValue = textureMap.normal >= 0 ?
+                          samplePBRTexture(textures[nonuniformEXT(textureMap.normal)], uv, atlasUvMin, atlasUvMax, lod,
+                                           VPT_PBR_SAMPLING_MODE) :
+                          vec4(0.0);
+        if (hasHeightMap && textureMap.normal >= 0) {
+            ivec2 heightMapSize = textureSize(textures[nonuniformEXT(textureMap.normal)], 0);
+            // Only where the texture is carved there: the band is for the walls a carved border grows. On a
+            // texture with a normal map and no depth it was a ring of flat shading round every face, a dark line
+            // round the top of a grass block.
+            useFlatEdgeBand = normalValue.a < 0.999 && isEdgeUV(uv, atlasUvMin, atlasUvMax, heightMapSize);
+        }
+    }
+
+    vec3 tint = vptSurfaceColour(albedoValue.rgb * colorLayer) + glint;
+    if (useOverlay) {
+        vec4 overlayColor = sampleTexture(textures[nonuniformEXT(worldUBO.overlayTextureID)], overlayUV, 0, false);
+        tint = mix(overlayColor.rgb, vptSurfaceColour(albedoValue.rgb * colorLayer), overlayColor.a) + glint;
+    }
+
+    albedoValue = vec4(tint, albedoValue.a);
+    // Glass and panes read from their texture only how clear they are and their colour: Bedrock packs author
+    // glass with subsurface scattering and roughness that made it shade as a milky solid, and a pane's mip levels
+    // blend its frame into the clear middle, so from a distance it went grey and let little through.
+    if (g_hitIsGlass) {
+        float clarity = sampleTexture(textures[nonuniformEXT(textureID)], uv, 0.0, false).a * colorLayerValue.a;
+        albedoValue.a = resolveSurfaceAlpha(clarity, alphaMode);
+        specularValue = vec4(0.0);
+    }
+    LabPBRMat mat = convertLabPBRMaterial(albedoValue, specularValue, normalValue);
+
+    vec3 geometricNormal = localHit.sideWall ? localHit.geometricNormal : baseGeoNormal;
+    vec3 shadingNormal = geometricNormal;
+    bool useWaterMaterial = isWaterMaterial && !localHit.sideWall;
+    if (useWaterMaterial) {
+        // The biome's water colour, as vanilla tints it; the refraction takes its square root, so the surface reads
+        // the colour lightly and depth (the pack's water medium, when there is one) does the rest.
+        vec3 waterTint = clamp(colorLayer, vec3(0.05), vec3(1.0));
+        albedoValue.rgb = waterTint;
+        tint = waterTint;
+        mat.f0 = vec3(0.02);
+        mat.albedo = waterTint;
+        mat.roughness = 0.01;
+        mat.metallic = 0.0;
+        mat.transmission = 1.0;
+        mat.ior = 1.333;
+
+        if (isFftWaterSurface) {
+            vec3 absWorldPos = worldPos + vec3(worldUBO.cameraPos.xyz);
+            vec3 waterCoordNormal = baseGeoNormal.y >= 0.0 ? baseGeoNormal : -baseGeoNormal;
+            vec2 waterCoord = fftWaterSurfaceCoord(absWorldPos, dPduWorld, dPdvWorld, waterCoordNormal);
+            FftWaterSample waterSample = sampleFftWater(waterCoord, worldUBO.gameTime);
+            vec3 tangent, bitangent;
+            fftWaterStableBasis(baseGeoNormal, tangent, bitangent);
+            vec3 localWaterNormal =
+                normalize(vec3(vec2(-waterSample.slope.x, waterSample.slope.y) * VPT_WATER_WAVE_STRENGTH, 1.0));
+            mat.roughness = clamp(0.005 + 0.012 * min(length(waterSample.slope), 0.45), 0.005, 0.022);
+            shadingNormal = applyNormalMapToBasis(localWaterNormal, tangent, bitangent, baseGeoNormal, viewDir);
+        } else if (VPT_WATER_SURFACE_MODE == 2u && bedrockWaterAvailable() && abs(baseGeoNormal.y) > 0.75) {
+            float footprint = mainRay.coneWidth + gl_HitTEXT * mainRay.coneSpread;
+            shadingNormal = bedrockWaterNormal(worldPos + vec3(worldUBO.cameraPos.xyz), baseGeoNormal, viewDir,
+                                               footprint, baseGeoNormal.y < 0.0);
+        }
+    }
+
+    // Water's sides (and any water face without the wave surface) stay flat, as in Bedrock RTX: the pack's water
+    // normal map bent the view through a vertical sheet of water into a blue smear.
+    if (!useWaterMaterial && !isFftWaterSurface && VPT_PBR_SAMPLING_MODE != 0u && hasHeightMap && !localHit.sideWall && textureMap.normal >= 0 &&
+        !useFlatEdgeBand) {
+        geometricNormal = sampleNormal(textures[nonuniformEXT(textureMap.normal)], uv, atlasUvMin, atlasUvMax,
+                                       dPduWorld, dPdvWorld, baseGeoNormal, 0, VPT_PBR_SAMPLING_MODE,
+                                       maxDepthWorld, viewDir);
+    }
+
+    // Glass keeps its face's own normal: the bevel a pack's normal map gives the frame, seen from inside the block
+    // through the clear part, faced away from the view and went black along every join.
+    if (!isFftWaterSurface && !localHit.sideWall && !useWaterMaterial && !g_hitIsGlass) {
+        vec3 tangent, bitangent;
+        tangent = normalizeF(dPduWorld - geometricNormal * dot(geometricNormal, dPduWorld),
+                             abs(geometricNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0));
+        bitangent = normalizeF(cross(geometricNormal, tangent), dPdvWorld);
+        tangent = normalizeF(cross(bitangent, geometricNormal), tangent);
+        shadingNormal = applyNormalMapToBasis(mat.normal, tangent, bitangent, geometricNormal, viewDir);
+    }
+
+    // Rain soaks the ground under open sky: darker, glossy, and the bumps of the normal map drown.
+    if (!useWaterMaterial && !isFftWaterSurface && !g_hitIsGlass) {
+        float wetness = vptGroundWetness(worldPos, baseGeoNormal);
+        if (wetness > 0.0) {
+            vptApplyGroundWetness(mat, wetness);
+            shadingNormal = normalizeF(mix(shadingNormal, geometricNormal, wetness * 0.7), geometricNormal);
+        }
+    }
+
+    surface.uv = uv;
+    surface.depth = localHit.depth;
+    surface.edgeWall = localHit.edgeWall;
+    surface.worldPos = worldPos;
+    surface.geometricNormal = geometricNormal;
+    surface.shadingNormal = shadingNormal;
+    surface.albedoValue = albedoValue;
+    surface.specularValue = specularValue;
+    surface.normalValue = normalValue;
+    surface.tint = tint;
+    surface.mat = mat;
+}
+
+vec3 basePlaneWorldPosAtUv(vec2 uv,
+                           vec2 referenceUv,
+                           vec3 referenceWorldPos,
+                           vec3 dPduWorld,
+                           vec3 dPdvWorld) {
+    vec2 uvOffset = uv - referenceUv;
+    return referenceWorldPos + dPduWorld * uvOffset.x + dPdvWorld * uvOffset.y;
+}
+
+void initVanillaParallaxMiss(vec2 uv, float depth, vec3 baseNormal, out HeightMapHit hit) {
+    hit.hit = false;
+    hit.sideWall = false;
+    hit.edgeWall = false;
+    hit.t = INF_DISTANCE;
+    hit.uv = uv;
+    hit.depth = depth;
+    hit.geometricNormal = baseNormal;
+}
+
+bool traceNearestHeightMapCapped(sampler2D tex,
+                                 vec2 minUV,
+                                 vec2 maxUV,
+                                 vec2 uv,
+                                 float depth,
+                                 vec3 worldDir,
+                                 vec3 dPdu,
+                                 vec3 dPdv,
+                                 vec3 baseNormal,
+                                 float maxDepth,
+                                 int maxTraceSteps,
+                                 out HeightMapHit hit) {
+    initVanillaParallaxMiss(uv, depth, baseNormal, hit);
+    if (maxTraceSteps <= 0 || maxDepth <= heightMapMinWorldDepth) { return false; }
+
+    ivec2 size = textureSize(tex, 0);
+    if (size.x <= 0 || size.y <= 0) { return false; }
+
+    vec2 boundsMin = heightMapMinUV(minUV, maxUV, size);
+    vec2 boundsMax = heightMapMaxUV(minUV, maxUV, size);
+    if (!isUvWithinHeightMap(uv, boundsMin, boundsMax)) { return false; }
+    float minEdgeDepth = edgeMinDepth(minUV, maxUV, size, maxDepth);
+
+    vec2 rateUV = directionToRateUv(worldDir, dPdu, dPdv);
+    float depthRate = dot(worldDir, -baseNormal);
+
+    // A tile's edges fall on whole texels, but atlas coordinates carry float error: ceil() of a max edge that came
+    // out a hair above its texel boundary took in the first texel of the next sprite, whose heights then stood
+    // as a one texel wall - a black line along every block seam, seen only when looking towards that edge.
+    ivec2 atlasTexelMin = clampTexelCoord(ivec2(round(min(minUV, maxUV) * vec2(size))), size);
+    ivec2 atlasTexelMax = clampTexelCoord(ivec2(round(max(minUV, maxUV) * vec2(size))) - ivec2(1), size);
+    ivec2 texel = clampTexelCoord(ivec2(floor(uv * vec2(size))), size);
+    if (any(lessThan(texel, atlasTexelMin)) || any(greaterThan(texel, atlasTexelMax))) { return false; }
+
+    int remainingUSteps = heightMapRemainingSteps(texel.x, atlasTexelMin.x, atlasTexelMax.x, rateUV.x);
+    int remainingVSteps = heightMapRemainingSteps(texel.y, atlasTexelMin.y, atlasTexelMax.y, rateUV.y);
+    int maxSteps = min(maxTraceSteps, min(heightMapNearestMaxSteps, remainingUSteps + remainingVSteps + 4));
+    if (maxSteps <= 0) { return false; }
+
+    float tCurrent = 0.0;
+    vec2 uvCurrent = uv;
+    float depthCurrent = depth;
+
+    int step = 0;
+    while (step < maxSteps) {
+        if (depthCurrent < -heightMapTraceBias) { break; }
+        if (any(lessThan(texel, atlasTexelMin)) || any(greaterThan(texel, atlasTexelMax))) { break; }
+
+        float surfaceDepth = sampleHeightDepthNearest(tex, texel, atlasTexelMin, atlasTexelMax, uvCurrent, maxDepth);
+        if (depthCurrent >= surfaceDepth - heightMapTraceBias) {
+            hit.hit = true;
+            hit.sideWall = false;
+            hit.edgeWall = false;
+            hit.t = tCurrent;
+            hit.uv = uvCurrent;
+            hit.depth = max(depthCurrent, surfaceDepth);
+            hit.geometricNormal = baseNormal;
+            return true;
+        }
+
+        float tTop = INF_DISTANCE;
+        if (depthRate > 1e-6 && surfaceDepth > depthCurrent) { tTop = (surfaceDepth - depthCurrent) / depthRate; }
+
+        float tU = INF_DISTANCE;
+        float tV = INF_DISTANCE;
+        bool stepU = false;
+        bool stepV = false;
+
+        if (rateUV.x > 1e-9) {
+            float boundary = (float(texel.x + 1)) / float(size.x);
+            tU = (boundary - uvCurrent.x) / rateUV.x;
+            stepU = true;
+        } else if (rateUV.x < -1e-9) {
+            float boundary = float(texel.x) / float(size.x);
+            tU = (boundary - uvCurrent.x) / rateUV.x;
+            stepU = true;
+        }
+
+        if (rateUV.y > 1e-9) {
+            float boundary = (float(texel.y + 1)) / float(size.y);
+            tV = (boundary - uvCurrent.y) / rateUV.y;
+            stepV = true;
+        } else if (rateUV.y < -1e-9) {
+            float boundary = float(texel.y) / float(size.y);
+            tV = (boundary - uvCurrent.y) / rateUV.y;
+            stepV = true;
+        }
+
+        float tAbove = INF_DISTANCE;
+        if (depthRate < -1e-6) { tAbove = -depthCurrent / depthRate; }
+
+        float tEdge = min(tU, tV);
+        if (tTop <= min(tEdge, tAbove) + heightMapTraceBias && tTop < INF_DISTANCE) {
+            tCurrent += max(tTop, 0.0);
+            hit.hit = true;
+            hit.sideWall = false;
+            hit.edgeWall = false;
+            hit.t = tCurrent;
+            hit.uv = uvCurrent + rateUV * max(tTop, 0.0);
+            hit.depth = surfaceDepth;
+            hit.geometricNormal = baseNormal;
+            return true;
+        }
+
+        if (tAbove <= tEdge + heightMapTraceBias) { break; }
+        if (tEdge == INF_DISTANCE) { break; }
+
+        float dt = max(tEdge, 0.0);
+        tCurrent += dt;
+
+        vec2 edgeUV = uvCurrent + rateUV * dt;
+        float edgeDepth = depthCurrent + depthRate * dt;
+        bool cornerStep = stepU && stepV && abs(tU - tV) <= heightMapTraceBias;
+        if (cornerStep) {
+            ivec2 texelU = texel + ivec2(rateUV.x > 0.0 ? 1 : -1, 0);
+            ivec2 texelV = texel + ivec2(0, rateUV.y > 0.0 ? 1 : -1);
+            ivec2 texelD = texel + ivec2(rateUV.x > 0.0 ? 1 : -1, rateUV.y > 0.0 ? 1 : -1);
+            bool inU = all(greaterThanEqual(texelU, atlasTexelMin)) && all(lessThanEqual(texelU, atlasTexelMax));
+            bool inV = all(greaterThanEqual(texelV, atlasTexelMin)) && all(lessThanEqual(texelV, atlasTexelMax));
+            bool inD = all(greaterThanEqual(texelD, atlasTexelMin)) && all(lessThanEqual(texelD, atlasTexelMax));
+
+            if (inU && inV && inD) {
+                float depthUCorner =
+                    sampleHeightDepthNearest(tex, texelU, atlasTexelMin, atlasTexelMax, edgeUV, maxDepth);
+                float depthVCorner =
+                    sampleHeightDepthNearest(tex, texelV, atlasTexelMin, atlasTexelMax, edgeUV, maxDepth);
+                float depthDCorner =
+                    sampleHeightDepthNearest(tex, texelD, atlasTexelMin, atlasTexelMax, edgeUV, maxDepth);
+                bool enteredWallU = enteredTexelWall(surfaceDepth, depthUCorner, edgeDepth) ||
+                                    enteredTexelWall(depthVCorner, depthDCorner, edgeDepth);
+                bool enteredWallV = enteredTexelWall(surfaceDepth, depthVCorner, edgeDepth) ||
+                                    enteredTexelWall(depthUCorner, depthDCorner, edgeDepth);
+
+                if (enteredWallU || enteredWallV) {
+                    hit.hit = true;
+                    hit.sideWall = true;
+                    hit.edgeWall = false;
+                    hit.t = tCurrent;
+                    hit.uv = edgeUV;
+                    hit.depth = edgeDepth;
+                    hit.geometricNormal = wallNormal(enteredWallU, enteredWallV, rateUV, dPdu, dPdv, baseNormal);
+                    return true;
+                }
+
+                texel = texelD;
+                uvCurrent = edgeUV;
+                depthCurrent = edgeDepth;
+                ++step;
+                continue;
+            }
+        }
+
+        bool processU = false;
+        if (tU <= tV + heightMapTraceBias) {
+            processU = tU < tV - heightMapTraceBias ? true : abs(rateUV.x) >= abs(rateUV.y);
+        }
+
+        ivec2 nextTexel = texel;
+        bool enteredSideWall = false;
+        vec3 enteredWallNormal = baseNormal;
+        bool enteredTop = false;
+
+        if (processU) {
+            nextTexel += ivec2(rateUV.x > 0.0 ? 1 : -1, 0);
+            if (any(lessThan(nextTexel, atlasTexelMin)) || any(greaterThan(nextTexel, atlasTexelMax))) {
+                vec3 edgeNormal;
+                if (isEdge(edgeDepth, surfaceDepth, minEdgeDepth, edgeUV, boundsMin, boundsMax, rateUV, dPdu, dPdv,
+                           baseNormal, edgeNormal)) {
+                    hit.hit = true;
+                    hit.sideWall = true;
+                    hit.edgeWall = true;
+                    hit.t = tCurrent;
+                    hit.uv = clamp(edgeUV, boundsMin, boundsMax);
+                    hit.depth = edgeDepth;
+                    hit.geometricNormal = edgeNormal;
+                    return true;
+                }
+                break;
+            }
+
+            float nextDepth =
+                sampleHeightDepthNearest(tex, nextTexel, atlasTexelMin, atlasTexelMax, edgeUV, maxDepth);
+            if (enteredTexelWall(surfaceDepth, nextDepth, edgeDepth)) {
+                enteredSideWall = true;
+                enteredWallNormal = wallNormal(true, false, rateUV, dPdu, dPdv, baseNormal);
+            } else if (shouldContinueTexelTop(surfaceDepth, nextDepth, edgeDepth)) {
+                enteredTop = true;
+            }
+        }
+
+        if (!processU) {
+            nextTexel = texel + ivec2(0, rateUV.y > 0.0 ? 1 : -1);
+            if (any(lessThan(nextTexel, atlasTexelMin)) || any(greaterThan(nextTexel, atlasTexelMax))) {
+                vec3 edgeNormal;
+                if (isEdge(edgeDepth, surfaceDepth, minEdgeDepth, edgeUV, boundsMin, boundsMax, rateUV, dPdu, dPdv,
+                           baseNormal, edgeNormal)) {
+                    hit.hit = true;
+                    hit.sideWall = true;
+                    hit.edgeWall = true;
+                    hit.t = tCurrent;
+                    hit.uv = clamp(edgeUV, boundsMin, boundsMax);
+                    hit.depth = edgeDepth;
+                    hit.geometricNormal = edgeNormal;
+                    return true;
+                }
+                break;
+            }
+
+            float nextDepth =
+                sampleHeightDepthNearest(tex, nextTexel, atlasTexelMin, atlasTexelMax, edgeUV, maxDepth);
+            if (enteredTexelWall(surfaceDepth, nextDepth, edgeDepth)) {
+                enteredSideWall = true;
+                enteredWallNormal = wallNormal(false, true, rateUV, dPdu, dPdv, baseNormal);
+            } else if (shouldContinueTexelTop(surfaceDepth, nextDepth, edgeDepth)) {
+                enteredTop = true;
+            }
+        }
+
+        if (enteredSideWall) {
+            hit.hit = true;
+            hit.sideWall = true;
+            hit.edgeWall = false;
+            hit.t = tCurrent;
+            hit.uv = edgeUV;
+            hit.depth = edgeDepth;
+            hit.geometricNormal = enteredWallNormal;
+            return true;
+        }
+
+        if (enteredTop) {
+            hit.hit = true;
+            hit.sideWall = false;
+            hit.edgeWall = false;
+            hit.t = tCurrent;
+            hit.uv = edgeUV;
+            hit.depth = surfaceDepth;
+            hit.geometricNormal = baseNormal;
+            return true;
+        }
+
+        texel = nextTexel;
+        uvCurrent = edgeUV;
+        depthCurrent = edgeDepth;
+        ++step;
+    }
+
+    return false;
+}
+
+bool traceBilinearHeightMapCapped(sampler2D tex,
+                                  vec2 minUV,
+                                  vec2 maxUV,
+                                  vec2 uv,
+                                  float depth,
+                                  vec3 worldDir,
+                                  vec3 dPdu,
+                                  vec3 dPdv,
+                                  vec3 baseNormal,
+                                  float maxDepth,
+                                  int maxTraceSteps,
+                                  out HeightMapHit hit) {
+    initVanillaParallaxMiss(uv, depth, baseNormal, hit);
+    if (maxTraceSteps <= 0 || maxDepth <= heightMapMinWorldDepth) { return false; }
+
+    ivec2 size = textureSize(tex, 0);
+    if (size.x <= 0 || size.y <= 0) { return false; }
+
+    vec2 boundsMin = heightMapMinUV(minUV, maxUV, size);
+    vec2 boundsMax = heightMapMaxUV(minUV, maxUV, size);
+    if (!isUvWithinHeightMap(uv, boundsMin, boundsMax)) { return false; }
+    float minEdgeDepth = edgeMinDepth(minUV, maxUV, size, maxDepth);
+
+    vec2 rateUV = directionToRateUv(worldDir, dPdu, dPdv);
+    float depthRate = dot(worldDir, -baseNormal);
+    float texelTravel = max(abs(rateUV.x) * float(size.x), abs(rateUV.y) * float(size.y));
+    float depthTravel = abs(depthRate) / max(maxDepth, heightMapMinWorldDepth) * float(max(size.x, size.y));
+    float stepWorld = 0.5 / max(max(texelTravel, depthTravel), 1e-4);
+
+    float tPrev = 0.0;
+    vec2 uvPrev = uv;
+    float depthPrev = depth;
+    float surfacePrev = sampleHeightDepth(tex, uvPrev, minUV, maxUV, 0, 1u, maxDepth);
+    float fPrev = depthPrev - surfacePrev;
+    if (fPrev >= -heightMapTraceBias) {
+        hit.hit = true;
+        hit.t = 0.0;
+        hit.uv = uvPrev;
+        hit.depth = surfacePrev;
+        hit.geometricNormal =
+            sampleNormal(tex, uvPrev, minUV, maxUV, dPdu, dPdv, baseNormal, 0, 1u, maxDepth, -worldDir);
+        return true;
+    }
+
+    int maxSteps = min(maxTraceSteps, heightMapBilinearMaxSteps);
+    for (int step = 0; step < maxSteps; ++step) {
+        float tCurr = tPrev + stepWorld;
+        vec2 uvCurr = uv + rateUV * tCurr;
+        float depthCurr = depth + depthRate * tCurr;
+        if (!isUvWithinHeightMap(uvCurr, boundsMin, boundsMax)) {
+            float tEdge = heightMapBoundaryHitT(tPrev, tCurr, uvPrev, uvCurr, boundsMin, boundsMax);
+            vec2 uvClamped = clamp(uv + rateUV * tEdge, boundsMin, boundsMax);
+            float depthEdge = depth + depthRate * tEdge;
+            vec3 edgeNormal;
+            float boundaryDepth = sampleHeightDepth(tex, uvClamped, minUV, maxUV, 0, 1u, maxDepth);
+            if (isEdge(depthEdge, boundaryDepth, minEdgeDepth, uvClamped, boundsMin, boundsMax, rateUV, dPdu, dPdv,
+                       baseNormal, edgeNormal)) {
+                hit.hit = true;
+                hit.sideWall = true;
+                hit.edgeWall = true;
+                hit.t = tEdge;
+                hit.uv = uvClamped;
+                hit.depth = depthEdge;
+                hit.geometricNormal = edgeNormal;
+                return true;
+            }
+            break;
+        }
+        if (depthCurr < -heightMapTraceBias) { break; }
+
+        float surfaceCurr = sampleHeightDepth(tex, uvCurr, minUV, maxUV, 0, 1u, maxDepth);
+        float fCurr = depthCurr - surfaceCurr;
+        if (fCurr >= -heightMapTraceBias) {
+            float lo = tPrev;
+            float hi = tCurr;
+            for (int refine = 0; refine < heightMapBilinearBinarySteps; ++refine) {
+                float mid = 0.5 * (lo + hi);
+                vec2 uvMid = uv + rateUV * mid;
+                float depthMid = depth + depthRate * mid;
+                float surfaceMid = sampleHeightDepth(tex, uvMid, minUV, maxUV, 0, 1u, maxDepth);
+                if (depthMid >= surfaceMid) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+
+            float tHit = hi;
+            vec2 uvHit = uv + rateUV * tHit;
+            float depthHit = sampleHeightDepth(tex, uvHit, minUV, maxUV, 0, 1u, maxDepth);
+            hit.hit = true;
+            hit.sideWall = false;
+            hit.edgeWall = false;
+            hit.t = tHit;
+            hit.uv = uvHit;
+            hit.depth = depthHit;
+            hit.geometricNormal =
+                sampleNormal(tex, uvHit, minUV, maxUV, dPdu, dPdv, baseNormal, 0, 1u, maxDepth, -worldDir);
+            return true;
+        }
+
+        tPrev = tCurr;
+        uvPrev = uvCurr;
+        depthPrev = depthCurr;
+        fPrev = fCurr;
+    }
+
+    return false;
+}
+
+bool traceHeightMapCapped(sampler2D tex,
+                          vec2 minUV,
+                          vec2 maxUV,
+                          vec2 uv,
+                          float depth,
+                          vec3 worldDir,
+                          vec3 dPdu,
+                          vec3 dPdv,
+                          vec3 baseNormal,
+                          float maxDepth,
+                          uint samplingMode,
+                          int maxTraceSteps,
+                          out HeightMapHit hit) {
+    if (samplingMode == 0u) {
+        return traceNearestHeightMapCapped(tex, minUV, maxUV, uv, depth, worldDir, dPdu, dPdv, baseNormal, maxDepth,
+                                           maxTraceSteps, hit);
+    }
+
+    return traceBilinearHeightMapCapped(tex, minUV, maxUV, uv, depth, worldDir, dPdu, dPdv, baseNormal, maxDepth,
+                                        maxTraceSteps, hit);
+}
+
+bool traceLocalHeightIntersectionAndExit(int normalTextureID,
+                                         vec2 atlasUvMin,
+                                         vec2 atlasUvMax,
+                                         vec3 dPduWorld,
+                                         vec3 dPdvWorld,
+                                         vec3 baseGeoNormal,
+                                         float maxDepthWorld,
+                                         SampledSurface surface,
+                                         vec3 worldDir,
+                                         int maxTraceSteps,
+                                         out HeightMapHit hit,
+                                         out vec2 exitUv,
+                                         out float exitDepth,
+                                         out float exitDistance) {
+    ivec2 heightMapSize = textureSize(textures[nonuniformEXT(normalTextureID)], 0);
+    if (normalTextureID < 0 || maxDepthWorld <= heightMapMinWorldDepth) { return false; }
+    if (heightMapSize.x <= 0 || heightMapSize.y <= 0) { return false; }
+    vec2 traceAtlasUvMin = heightMapInnerMinUV(atlasUvMin, atlasUvMax, heightMapSize);
+    vec2 traceAtlasUvMax = heightMapInnerMaxUV(atlasUvMin, atlasUvMax, heightMapSize);
+    vec2 traceSurfaceUv = surface.edgeWall ? clamp(surface.uv, traceAtlasUvMin, traceAtlasUvMax) : surface.uv;
+
+    initVanillaParallaxMiss(traceSurfaceUv, surface.depth, baseGeoNormal, hit);
+    exitUv = traceSurfaceUv;
+    exitDepth = surface.depth;
+    exitDistance = 0.0;
+
+    float startBias = 2.0 * heightMapTraceBias;
+    vec2 rateUV = directionToRateUv(worldDir, dPduWorld, dPdvWorld);
+    float depthRate = dot(worldDir, -baseGeoNormal);
+    vec2 uv = traceSurfaceUv + rateUV * startBias;
+    float depth = surface.depth + depthRate * startBias;
+    if (dot(surface.geometricNormal, baseGeoNormal) > 0.5 && depthRate < 0.0) {
+        depth = min(depth, surface.depth - startBias);
+    }
+
+    bool fallbackToBilinear =
+        VPT_PBR_SAMPLING_MODE == 0u && shouldFallbackNearestSecondaryToBilinear(worldDir, baseGeoNormal);
+    bool localHit;
+    if (depthRate < -1e-6) {
+        float maxTraceDistance = max(depth / -depthRate, 0.0);
+        if (fallbackToBilinear) {
+            localHit =
+                traceBilinearHeightMap(textures[nonuniformEXT(normalTextureID)], traceAtlasUvMin, traceAtlasUvMax, uv, depth,
+                                       worldDir, dPduWorld, dPdvWorld, baseGeoNormal, maxDepthWorld,
+                                       maxTraceDistance, hit);
+        } else {
+            localHit =
+                traceHeightMap(textures[nonuniformEXT(normalTextureID)], traceAtlasUvMin, traceAtlasUvMax, uv, depth, worldDir,
+                               dPduWorld, dPdvWorld, baseGeoNormal, maxDepthWorld, maxTraceDistance,
+                               VPT_PBR_SAMPLING_MODE, hit);
+        }
+    } else if (fallbackToBilinear) {
+        localHit = traceBilinearHeightMapCapped(textures[nonuniformEXT(normalTextureID)], traceAtlasUvMin, traceAtlasUvMax, uv,
+                                                depth, worldDir, dPduWorld, dPdvWorld, baseGeoNormal, maxDepthWorld,
+                                                maxTraceSteps, hit);
+    } else {
+        localHit = traceHeightMapCapped(textures[nonuniformEXT(normalTextureID)], traceAtlasUvMin, traceAtlasUvMax, uv, depth,
+                                        worldDir, dPduWorld, dPdvWorld, baseGeoNormal, maxDepthWorld,
+                                        VPT_PBR_SAMPLING_MODE, maxTraceSteps, hit);
+    }
+
+    if (localHit) { return true; }
+
+    if (depthRate >= -1e-6) { return true; }
+
+    float exitT = max(depth / -depthRate, 0.0);
+    exitUv = clamp(uv + rateUV * exitT, traceAtlasUvMin, traceAtlasUvMax);
+    exitDepth = 0.0;
+    exitDistance = exitT;
+    return false;
+}
+
+vec3 sampleSurfaceDirectLight(SampledSurface surface,
+                              vec3 viewDir,
+                              vec2 referenceUv,
+                              vec3 referenceWorldPos,
+                              vec2 atlasUvMin,
+                              vec2 atlasUvMax,
+                              vec3 dPduWorld,
+                              vec3 dPdvWorld,
+                              vec3 baseGeoNormal,
+                              bool traceLocalHeight,
+                              int normalTextureID,
+                              float maxDepthWorld,
+                              bool isFftWaterSurface) {
+    // The overworld's sun or moon, or the End's flash while it lasts (shadow.rmiss gives its light).
+    bool endFlash = worldUBO.skyType == 2 && endFlashIntensity() > 1e-3;
+    if (worldUBO.skyType != 1 && !endFlash) { return vec3(0.0); }
+
+    bool isOpaqueSurface = surface.mat.transmission <= EPS;
+    vec3 lightDir = celestialSunDirection();
+    if (lightDir.y < 0.0 && !endFlash) { lightDir = -lightDir; }
+
+    vec3 sampledLightDir = SampleVMF(mainRay.seed, lightDir, 3000.0);
+    float sampledLightNoL = dot(sampledLightDir, surface.geometricNormal);
+    if (isOpaqueSurface && sampledLightNoL <= 0.0) { return vec3(0.0); }
+
+    float lightPdf;
+    vec3 lightBRDF = DisneyEval(surface.mat, viewDir, surface.shadingNormal, sampledLightDir, lightPdf);
+    if (lightPdf <= 1e-6) { return vec3(0.0); }
+
+    vec3 shadowOriginPos = surface.worldPos;
+    vec3 shadowOriginGeomNormal = surface.geometricNormal;
+    if (traceLocalHeight) {
+        HeightMapHit shadowSelfHit;
+        vec2 exitUv;
+        float exitDepth;
+        float exitDistance;
+        if (traceLocalHeightIntersectionAndExit(normalTextureID, atlasUvMin, atlasUvMax, dPduWorld, dPdvWorld,
+                                                baseGeoNormal, maxDepthWorld, surface, sampledLightDir,
+                                                VPT_PARALLAX_SECONDARY_MAX_STEPS, shadowSelfHit, exitUv, exitDepth,
+                                                exitDistance)) {
+            return vec3(0.0);
+        }
+        if (!surface.edgeWall) {
+            shadowOriginPos =
+                basePlaneWorldPosAtUv(exitUv, referenceUv, referenceWorldPos, dPduWorld, dPdvWorld) -
+                baseGeoNormal * exitDepth;
+            shadowOriginGeomNormal = baseGeoNormal;
+        }
+    }
+
+    shadowRay.radiance = vec3(0.0);
+    shadowRay.throughput = vec3(1.0);
+    shadowRay.insideBoat = rayInsideBoat(mainRay) ? 1u : 0u;
+    shadowRay.pad0 = 0u;
+
+    vec3 baseWorldPos = shadowOriginPos;
+    vec3 exitGeoNormal = shadowOriginGeomNormal;
+    vec3 shadowOrigin = baseWorldPos - sampledLightDir * 0.0002;
+    if (!surface.edgeWall) {
+        vec3 visibilityNormal = dot(sampledLightDir, exitGeoNormal) >= 0.0 ? exitGeoNormal : -exitGeoNormal;
+        shadowOrigin = baseWorldPos + visibilityNormal * 0.0002;
+    }
+    uint shadowMask = WORLD_MASK | PLAYER_MASK;
+    if (VPT_CLOUD_MODE != 2u) { shadowMask |= CLOUD_MASK; }
+    traceRayEXT(topLevelAS, VPT_SHADOW_RAY_FLAGS, shadowMask, 0, 0, 0,
+                shadowOrigin, 0.0001, sampledLightDir, 1000.0, 1);
+
+    float progress = skyUBO.rainGradient;
+    vec3 lightRadiance = shadowRay.radiance * mainRay.throughput * lightBRDF;
+    if (VPT_CLOUD_MODE == 2u) {
+        vec3 absoluteShadowOriginPos = baseWorldPos + vec3(worldUBO.cameraPos.xyz);
+        float cloudVisibility = volumetricCloudLightVisibility(absoluteShadowOriginPos, lightDir,
+                                                               max(VPT_VOLUMETRIC_CLOUD_LIGHT_STEPS, 1), 0.175);
+        lightRadiance *= cloudVisibility;
+    }
+    return mix(lightRadiance, vec3(0.0), progress);
+}
+
+#include "common/block_light.glsl"
+
+bool loadPreviousScenePos(uint geometryBufferIndex, uint primitiveID, vec3 baryCoords, out vec3 prevScenePos) {
+    uint64_t lastPositionAddr = lastPositionBufferAddrs.addrs[geometryBufferIndex];
+    uint64_t lastIndexAddr = lastIndexBufferAddrs.addrs[geometryBufferIndex];
+    if (lastPositionAddr == 0 || lastIndexAddr == 0) { return false; }
+
+    IndexBuffer lastIndexBuffer = IndexBuffer(lastIndexAddr);
+    uint indexBaseID = 3u * primitiveID;
+    uint i0 = lastIndexBuffer.indices[indexBaseID];
+    uint i1 = lastIndexBuffer.indices[indexBaseID + 1u];
+    uint i2 = lastIndexBuffer.indices[indexBaseID + 2u];
+
+    PositionBuffer lastPositionBuffer = PositionBuffer(lastPositionAddr);
+    vec3 p0 = lastPositionBuffer.vertices[i0].pos;
+    vec3 p1 = lastPositionBuffer.vertices[i1].pos;
+    vec3 p2 = lastPositionBuffer.vertices[i2].pos;
+    vec3 prevLocalPos = baryCoords.x * p0 + baryCoords.y * p1 + baryCoords.z * p2;
+    mat4 lastModelMat = lastObjToWorldMats.mat[gl_InstanceCustomIndexEXT];
+    prevScenePos = mat3(lastModelMat) * prevLocalPos + lastModelMat[3].xyz;
+    return true;
+}
+
+// How much of a sheet of water seen side on is its texture, the rest seen through.
+const float WATER_SHEET_OPACITY = 0.45;
+
+// How much of the open sky is seen from here along a direction: 0 under a roof or behind a wall.
+float skyVisibilityAlong(vec3 position, vec3 direction) {
+    shadowRay.radiance = vec3(0.0);
+    shadowRay.throughput = vec3(1.0);
+    shadowRay.insideBoat = 0u;
+    shadowRay.pad0 = BLOCK_LIGHT_QUERY;
+    traceRayEXT(topLevelAS, VPT_SHADOW_RAY_FLAGS, WORLD_MASK, 0, 0, 0, position, 0.01, direction, 256.0, 1);
+    return clamp(dot(shadowRay.radiance, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+}
+
+// How open to the sky the water is straight up from here: the light the water scatters comes from the sky and the
+// sun above it, so water under a roof or in a cave stays dark instead of glowing with the open sky's light.
+float waterSkyVisibility(vec3 position) {
+    return skyVisibilityAlong(position, vec3(0.0, 1.0, 0.0));
+}
+
+void main() {
+    uint instanceID = gl_InstanceCustomIndexEXT;
+    uint geometryID = gl_GeometryIndexEXT;
+    uint geometryBufferIndex = getGeometryBufferIndex(instanceID, geometryID);
+
+    uint i0, i1, i2;
+    MaterialVertex m0, m1, m2;
+    loadTriangleIndices(geometryBufferIndex, gl_PrimitiveID, i0, i1, i2);
+    loadTriangleMaterial(geometryBufferIndex, i0, i1, i2, m0, m1, m2);
+    PositionVertex p0, p1, p2;
+    loadTrianglePositions(geometryBufferIndex, i0, i1, i2, p0, p1, p2);
+
+    vec3 baryCoords = vec3(1.0 - (attribs.x + attribs.y), attribs.x, attribs.y);
+    vec3 planeHitWorldPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+    vec3 baseViewDir = -mainRay.direction;
+
+    uint packedData = m0.packedData;
+    bool useColorLayer = hasColorLayer(packedData);
+    bool useTexture = hasTexture(packedData);
+    bool useGlint = hasGlint(packedData);
+    bool useOverlay = hasOverlay(packedData);
+    vec4 colorLayerValue = useColorLayer ?
+                               baryCoords.x * m0.colorLayer + baryCoords.y * m1.colorLayer + baryCoords.z * m2.colorLayer :
+                               vec4(1.0);
+    vec3 colorLayer = colorLayerValue.rgb;
+    uint bounce = rayBounce(mainRay);
+
+    // The stretch of water this ray just crossed. The camera's own stretch, when it is under water, is the ray
+    // generation's to fog; the rays leaving the first surface it sees are still in the water.
+    if (waterMediumActive()) {
+        if (rayInWater(mainRay)) {
+            vec3 waterTransmittance;
+            vec3 waterScatter;
+            // A ray that reached the water through a window is the camera's view of it as much as one that came
+            // straight down from the air: counted by bounces it passed for light filling the water, and a tank
+            // behind glass glowed with the open sky along every long sight line through it.
+            uint mediumBounce = mainRay.pad0 == RAY_VIEW_BOUNCE_MARK || rayCameraPath(mainRay) ? min(bounce, 1u) : bounce;
+            waterMediumSegment(gl_HitTEXT, waterMediumBounceDensity(mediumBounce), waterTransmittance, waterScatter);
+            float waterAmbient = max(waterMediumBounceAmbient(mediumBounce), 0.0);
+            if (waterAmbient > 0.0) {
+                // Some light still reaches under an overhang sideways through the water around it.
+                waterAmbient *= mix(0.35, 1.0,
+                                    waterSkyVisibility(gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * (gl_HitTEXT * 0.5)));
+            }
+            mainRay.radiance += mainRay.throughput * waterScatter * waterAmbient;
+            mainRay.throughput *= waterTransmittance;
+        } else if (bounce == 0u && skyUBO.cameraSubmersionType == 1) {
+            raySetInWater(mainRay, true);
+        }
+    }
+
+    float albedoEmission =
+        baryCoords.x * m0.albedoEmission + baryCoords.y * m1.albedoEmission + baryCoords.z * m2.albedoEmission;
+    uint textureID = m0.textureID;
+    uint alphaMode = getAlphaMode(packedData);
+    uint coordinate = getCoordinate(packedData);
+
+    vec2 textureUV = vec2(0.0);
+    TextureMapEntry textureMap = TextureMapEntry(-1, -1, -1);
+    vec2 atlasUvMin = vec2(0.0);
+    vec2 atlasUvMax = vec2(0.0);
+    float lod = 0.0;
+    vec3 dposdu = vec3(1.0, 0.0, 0.0);
+    vec3 dposdv = vec3(0.0, 1.0, 0.0);
+    bool hasHeightMapSurface = false;
+    float maxDepthWorld = 0.0;
+    mat3 objectToWorld = mat3(gl_ObjectToWorld3x4EXT);
+    mat3 normalMatrix = transpose(mat3(gl_WorldToObject3x4EXT));
+    vec3 baseGeoNormal =
+        normalizeF(normalMatrix * cross(p1.pos - p0.pos, p2.pos - p0.pos), vec3(0.0, 1.0, 0.0));
+    vec3 planeGeoNormal = baseGeoNormal;
+    vec3 dPduWorld = objectToWorld * dposdu;
+    vec3 dPdvWorld = objectToWorld * dposdv;
+    bool isWaterMaterial = false;
+    bool hasFftWaterSurface = false;
+    bool parallaxEnabled = VPT_ENABLE_PARALLAX != 0;
+    bool useRealisticWaterSurface = VPT_WATER_SURFACE_MODE == 1u;
+
+    if (useTexture) {
+        textureMap = mapping.entries[textureID];
+        textureUV = baryCoords.x * m0.textureUV + baryCoords.y * m1.textureUV + baryCoords.z * m2.textureUV;
+        atlasUvMin = min(m0.textureUV, min(m1.textureUV, m2.textureUV));
+        atlasUvMax = max(m0.textureUV, max(m1.textureUV, m2.textureUV));
+
+        float coneRadiusWorld = mainRay.coneWidth + gl_HitTEXT * mainRay.coneSpread;
+        computedposduDv(p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV, dposdu, dposdv);
+        if (isGlassSurface(packedData) && !isHeldSurface(packedData)) {
+            textureUV = seamlessGlassUV(textureUV, baryCoords.x * p0.pos + baryCoords.y * p1.pos + baryCoords.z * p2.pos,
+                                        dposdu, dposdv, packedData);
+            // Kept half a texel inside the sprite: on the frame's last column the filtered lookups of the material
+            // maps reached into the next sprite of the atlas, and that column came out black in places.
+            vec2 halfTexel = 0.5 / vec2(textureSize(textures[nonuniformEXT(textureID)], 0));
+            textureUV = clamp(textureUV, atlasUvMin + halfTexel, max(atlasUvMax - halfTexel, atlasUvMin + halfTexel));
+        }
+        lod = lodWithCone(textures[nonuniformEXT(textureID)], textureUV, coneRadiusWorld, dposdu, dposdv);
+
+        dPduWorld = objectToWorld * dposdu;
+        dPdvWorld = objectToWorld * dposdv;
+        planeGeoNormal = normalizeF(cross(dPduWorld, dPdvWorld), baseGeoNormal);
+        baseGeoNormal = planeGeoNormal;
+        if (dot(baseGeoNormal, baseViewDir) < 0.0) { baseGeoNormal = -baseGeoNormal; }
+
+        isWaterMaterial = isWaterSurface(packedData);
+        g_hitIsGlass = isGlassSurface(packedData);
+        if (textureMap.flag >= 0) {
+            ivec4 flags = ivec4(round(sampleTexture(textures[nonuniformEXT(textureMap.flag)], textureUV, ceil(lod), false) * 255.0));
+            isWaterMaterial = isWaterMaterial || (flags.r & 0x1) > 0;
+        }
+        hasFftWaterSurface = useRealisticWaterSurface && isWaterMaterial && abs(planeGeoNormal.y) > 0.75;
+
+        // A side of the water (where a sheet of water stands against glass or an opening, as in a wall of aquarium
+        // windows) is seen straight through, as in Bedrock RTX: the view carries on into the water, clear and sharp,
+        // with what is behind it as the surface the denoiser sees. Refracting and shading it as a surface turned it
+        // a milky smear. The medium still colours the stretch beyond.
+        if (isWaterMaterial && abs(planeGeoNormal.y) <= 0.75 && (bounce == 0u || rayCameraPath(mainRay))) {
+            mainRay.hitT = gl_HitTEXT;
+            mainRay.coneWidth += mainRay.hitT * mainRay.coneSpread;
+            mainRay.origin = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * (gl_HitTEXT + 0.002);
+            mainRay.normal = vec3(0.0);
+            mainRay.directLightRadiance = vec3(0.0);
+            mainRay.hasPrevScenePos = 0u;
+            // The pack's water texture stays on the sheet, faintly, so the falling water's streaks and their
+            // direction still show (Minecraft animates the flow texture in the atlas). Lit as the water around it.
+            vec4 sheet = sampleTexture(textures[nonuniformEXT(textureID)], textureUV, lod, false);
+            float sheetAlpha = clamp(sheet.a, 0.0, 1.0) * WATER_SHEET_OPACITY;
+            vec3 sheetLight = waterMediumIncomingLight() *
+                              mix(0.35, 1.0, waterSkyVisibility(gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT));
+            vec3 sheetColour = sheet.rgb * clamp(colorLayer, vec3(0.05), vec3(1.0));
+            mainRay.radiance += mainRay.throughput * sheetAlpha * sheetColour * sheetLight;
+            mainRay.throughput *= 1.0 - sheetAlpha;
+            rayStoreMaterial(mainRay, vec4(1.0), vec3(0.02), 1.0, 0.0, 1.0, 1.0, 0.0);
+            raySetInWater(mainRay, !rayInWater(mainRay));
+            raySetNoisy(mainRay, false);
+            raySetContinue(mainRay, true);
+            raySetPassThrough(mainRay, true);
+            raySetStop(mainRay, false);
+            return;
+        }
+
+        // The clear or tinted part of glass and panes is seen straight through by the camera, as in Bedrock RTX:
+        // the view carries on, filtered by the glass's colour, with a faint Fresnel reflection of the sky on top.
+        // Refracted as a surface, what lay behind was denoised as if it were on the glass and came out noisy and
+        // soft. The frame (opaque texels) stays a surface.
+        if (g_hitIsGlass && (bounce == 0u || rayCameraPath(mainRay))) {
+            vec4 glassTexel = sampleTexture(textures[nonuniformEXT(textureID)], textureUV, 0.0, false);
+            // The texture's own alpha, not the alpha mode's: stained glass is drawn as a stochastic surface, which rounds
+            // every texel to fully opaque, and it then never let the view through.
+            float glassAlpha = clamp(glassTexel.a * colorLayerValue.a, 0.0, 1.0);
+            // The thin top of a pane between two stacked panes (seamless glass) is inside the sheet: seen through as
+            // if it were not there. Opaque glass geometry never reaches the any-hit shader that leaves it out.
+            bool hiddenPaneTop = !isHeldSurface(packedData) && seamlessGlassHidesFace(p0.pos, p1.pos, p2.pos, packedData);
+            // Tinted glass is nearly opaque in its texture but still a window: seen through, darkened.
+            // Only texels that are see-through: the opaque dark pixels along a glass texture's frame, let through as
+            // if tinted, came out as black dashes along the joins (an opaque texel's tint lets nothing through).
+            if (hiddenPaneTop || glassAlpha < 0.9) {
+                vec3 incident = normalize(gl_WorldRayDirectionEXT);
+                float cosTheta = clamp(abs(dot(incident, baseGeoNormal)), 0.0, 1.0);
+                // Capped: at a grazing angle the full Fresnel term turned the edges of every window into bright rims of
+                // sky, glowing at night as if the glass gave off light.
+#if VPT_FRESNEL_MODEL != 0
+                // Bedrock: the glass face's own Fresnel, air into glass (n 1.5), uncapped.
+                float fresnel = vptInterfaceFresnel(cosTheta, 1.0 / 1.5);
+#else
+                float fresnel = min(0.04 + 0.96 * pow(1.0 - cosTheta, 5.0), 0.25);
+#endif
+                if (hiddenPaneTop) { fresnel = 0.0; }
+                // Only the sky above reflects: what the glass reflects below the horizon is the ground, not the bright
+                // haze at the bottom of the sky.
+                vec3 reflected = reflect(incident, baseGeoNormal);
+                // And the sky well above the horizon at that: a level view reflects level, and the haze along the
+                // horizon is the brightest stretch of the whole sky - it lay as a pale band at eye height across
+                // every window, over whatever was behind the glass.
+                vec3 skyDirection = normalize(vec3(reflected.x, max(reflected.y, 0.45), reflected.z));
+                vec3 skyReflection = texture(skyFull, skyDirection).rgb * smoothstep(-0.3, 0.1, reflected.y);
+                // Only where that sky is really open: a window inside a room, seen level or from below, reflected
+                // the bright sky through the ceiling and glowed as a pale blue sheet.
+                if (!hiddenPaneTop && max(skyReflection.r, max(skyReflection.g, skyReflection.b)) > 0.0) {
+                    vec3 glassPos = gl_WorldRayOriginEXT + incident * gl_HitTEXT;
+                    skyReflection *= skyVisibilityAlong(glassPos - incident * 0.01, skyDirection);
+                }
+#if VPT_FRESNEL_MODEL != 0
+                // Bedrock: the glass reflects the world, not only the sky. The ray generation shader traces that
+                // reflection once the view behind is done; it is asked for through the normal and the direct light
+                // fields, unused on a pass-through hit (the reflected direction and its weight).
+                vec3 glassReflectionWeight = mainRay.throughput * fresnel * clamp(VPT_GLASS_REFLECTION, 0.0, 1.0);
+#else
+                mainRay.radiance += mainRay.throughput * fresnel * skyReflection * clamp(VPT_GLASS_REFLECTION, 0.0, 1.0);
+#endif
+                vec3 filterColour = hiddenPaneTop ? vec3(1.0) : viewGlassTint(glassTexel.rgb * colorLayer, glassAlpha);
+                // Dark (tinted) glass shows its own texture lit by the sky, as a dark pane does, not only a dimmed view.
+                float tintedness = hiddenPaneTop ? 0.0 : glassDarkness(glassTexel.rgb * colorLayer);
+#if VPT_GLASS_TINT_MODEL == 0
+                mainRay.radiance += mainRay.throughput * (1.0 - fresnel) * tintedness * 0.35 * glassTexel.rgb *
+                                    texture(skyFull, vec3(0.0, 1.0, 0.0)).rgb;
+#endif
+                // Squared: light crossing a stained pane is coloured as deeply as the pane looks, not washed out.
+#if VPT_GLASS_TINT_MODEL != 0
+                // Bedrock colours what is seen through a glass block or pane once (it shows a single layer of
+                // translucency), by the colour as it is (see viewGlassTint). A block or pane is crossed through two
+                // faces, so each takes the square root: filtering fully at both left a stained window a dark,
+                // saturated slab that hid the room behind it.
+                mainRay.throughput *= sqrt(clamp(filterColour, 0.0, 1.0)) * (1.0 - fresnel);
+#else
+                mainRay.throughput *= pow(clamp(filterColour, 0.0, 1.0), vec3(2.0)) * (1.0 - fresnel);
+#endif
+                mainRay.hitT = gl_HitTEXT;
+                mainRay.coneWidth += mainRay.hitT * mainRay.coneSpread;
+                mainRay.origin = gl_WorldRayOriginEXT + incident * (gl_HitTEXT + 0.002);
+                mainRay.normal = vec3(0.0);
+                mainRay.directLightRadiance = vec3(0.0);
+#if VPT_FRESNEL_MODEL != 0
+                mainRay.normal = reflected;
+                mainRay.directLightRadiance = glassReflectionWeight;
+#endif
+                mainRay.hasPrevScenePos = 0u;
+                rayStoreMaterial(mainRay, vec4(1.0), vec3(0.04), 1.0, 0.0, 1.0, 1.0, 0.0);
+                raySetNoisy(mainRay, false);
+                raySetContinue(mainRay, true);
+                raySetPassThrough(mainRay, true);
+                raySetStop(mainRay, false);
+                return;
+            }
+        }
+
+        if (!isWaterMaterial && parallaxEnabled && bounce == 0u && textureMap.normal >= 0 && coordinate != 1u) {
+            maxDepthWorld = heightMapMaxDepthWorld(atlasUvMin, atlasUvMax, dPduWorld, dPdvWorld);
+            hasHeightMapSurface =
+                maxDepthWorld > heightMapMinWorldDepth && dot(baseViewDir, baseGeoNormal) > VPT_PARALLAX_MIN_VIEW_DOT;
+        }
+    } else {
+        dPduWorld = objectToWorld * dposdu;
+        dPdvWorld = objectToWorld * dposdv;
+    }
+    if (dot(baseGeoNormal, baseViewDir) < 0.0) { baseGeoNormal = -baseGeoNormal; }
+    // Glass is flat: carving its frame by a height map put dark side walls along the joins between glass blocks.
+    if (g_hitIsGlass) { hasHeightMapSurface = false; }
+    vec3 cameraOrigin = vec3(worldUBO.cameraEffectedViewMatInv * vec4(0.0, 0.0, 0.0, 1.0));
+    bool traceLocalHeight =
+        hasHeightMapSurface && (lod == 0.0 || distance(planeHitWorldPos, cameraOrigin) <= VPT_PARALLAX_CLOSE_DISTANCE) &&
+        !hasFftWaterSurface;
+
+    // Where the texture is not carved the ray is on the surface already. Tracing it all the same ran it through the
+    // edge handling of carved faces, which along the border of an uncarved one left a dark line - round the top of a
+    // grass block with a pack that gives it a normal map and no depth.
+    if (traceLocalHeight &&
+        sampleHeight(textures[nonuniformEXT(textureMap.normal)], textureUV, atlasUvMin, atlasUvMax, 0, 0u) >= 0.999) {
+        traceLocalHeight = false;
+    }
+
+    HeightMapHit initialHit;
+    initialHit.hit = false;
+    initialHit.sideWall = false;
+    initialHit.edgeWall = false;
+    initialHit.t = 0.0;
+    initialHit.uv = textureUV;
+    initialHit.depth = 0.0;
+    initialHit.geometricNormal = baseGeoNormal;
+    if (traceLocalHeight) {
+        HeightMapHit tracedInitialHit;
+        gParallaxDetectEdges = worldUBO.parallaxTransparentEdges != 0u;
+        if (traceHeightMapCapped(textures[nonuniformEXT(textureMap.normal)], atlasUvMin, atlasUvMax, textureUV, 0.0,
+                                 gl_WorldRayDirectionEXT, dPduWorld, dPdvWorld, baseGeoNormal, maxDepthWorld,
+                                 VPT_PBR_SAMPLING_MODE, VPT_PARALLAX_PRIMARY_MAX_STEPS, tracedInitialHit)) {
+            initialHit = tracedInitialHit;
+        }
+        gParallaxDetectEdges = false;
+    }
+    if (initialHit.edgeWall) {
+        // The ray reached the edge of this face below its carved surface. At an outer edge, with air past it, that
+        // corner is carved away too: the ray goes on and shows what is behind. Between two blocks the next face
+        // carries on instead, so there the edge keeps the border's colour. The two are told apart by the block's
+        // own face around the corner: Minecraft only keeps it where nothing covers it.
+        vec3 edgePos = planeHitWorldPos + gl_WorldRayDirectionEXT * initialHit.t;
+        vec3 outward = -initialHit.geometricNormal;
+        shadowRay.radiance = vec3(0.0);
+        shadowRay.throughput = vec3(1.0);
+        shadowRay.insideBoat = 0u;
+        shadowRay.pad0 = BLOCK_LIGHT_QUERY;
+        traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, WORLD_MASK, 0, 0, 0, edgePos - outward * 0.005, 0.0001, outward,
+                    0.02, 1);
+        shadowRay.pad0 = 0u;
+        bool outerEdge = shadowRay.radiance.r < 0.5;
+        if (outerEdge) {
+            mainRay.hitT = gl_HitTEXT + initialHit.t;
+            mainRay.coneWidth += mainRay.hitT * mainRay.coneSpread;
+            // Past the corner face along its normal, not just along the ray: a ray grazing that face would
+            // otherwise start on its inner side and hit it from within.
+            mainRay.origin = edgePos + outward * 0.003 + gl_WorldRayDirectionEXT * 0.001;
+            mainRay.normal = vec3(0.0);
+            mainRay.directLightRadiance = vec3(0.0);
+            mainRay.hasPrevScenePos = 0u;
+            rayStoreMaterial(mainRay, vec4(1.0), vec3(0.04), 1.0, 0.0, 1.0, 1.0, 0.0);
+            raySetNoisy(mainRay, false);
+            raySetContinue(mainRay, true);
+            raySetPassThrough(mainRay, true);
+            raySetStop(mainRay, false);
+            return;
+        }
+        initialHit.sideWall = false;
+        initialHit.edgeWall = false;
+        initialHit.geometricNormal = baseGeoNormal;
+    }
+
+    vec3 hitWorldPos = planeHitWorldPos + gl_WorldRayDirectionEXT * initialHit.t;
+    float actualHitT = gl_HitTEXT + initialHit.t;
+
+    mainRay.hitT = actualHitT;
+    mainRay.coneWidth += actualHitT * mainRay.coneSpread;
+    mainRay.directLightRadiance = vec3(0.0);
+    mainRay.hasPrevScenePos = 0u;
+    if (bounce == 0u) {
+        vec3 prevScenePos;
+        if (loadPreviousScenePos(geometryBufferIndex, gl_PrimitiveID, baryCoords, prevScenePos)) {
+            // A raindrop seen here was higher up the sheet last frame.
+            if (isRainSurface(packedData)) { prevScenePos.y += worldUBO.rainFallPerFrame; }
+            mainRay.prevScenePos = prevScenePos;
+            mainRay.hasPrevScenePos = 1u;
+        }
+    }
+
+    vec3 glint = vec3(0.0);
+    if (useGlint) {
+        vec2 glintUV = baryCoords.x * m0.glintUV + baryCoords.y * m1.glintUV + baryCoords.z * m2.glintUV;
+        glintUV = (worldUBO.textureMat * vec4(glintUV, 0.0, 1.0)).xy;
+        glint = sampleTexture(textures[nonuniformEXT(m0.glintTexture)], glintUV, false).rgb;
+    }
+    glint *= glint;
+
+    vec3 viewDir = -gl_WorldRayDirectionEXT;
+
+    SampledSurface surface;
+    sampleSurfaceState(useTexture, textureID, textureMap, atlasUvMin, atlasUvMax, initialHit.uv, lod, alphaMode,
+                       colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld, dPdvWorld,
+                       baseGeoNormal, hasHeightMapSurface, maxDepthWorld, initialHit, hitWorldPos, viewDir,
+                       isWaterMaterial, hasFftWaterSurface, surface);
+
+    mainRay.normal = surface.shadingNormal;
+    rayStoreMaterial(mainRay, surface.albedoValue, surface.mat.f0, surface.mat.roughness, surface.mat.metallic,
+                     surface.mat.transmission, surface.mat.ior, surface.mat.emission);
+    rayStoreAux(mainRay, isWaterMaterial ? vec2(VPT_FFT_WATER_ORIGIN_BIAS, 1.0) : vec2(0.0));
+
+    SampledSurface currentSurface = surface;
+    vec3 currentViewDir = viewDir;
+    bool storedLobeType = false;
+    for (int localBounce = 0; localBounce < 1; ++localBounce) {
+        // A glowing surface is seen brighter than the light it casts (Bedrock keeps the two apart): glowstone and
+        // lamps read as glowing whole, as there, while the room they light stays as it was. At 16x (the strength
+        // the light is cast with) glowstone showed its bright specks on a near-black block.
+        float emissionFactor =
+            (bounce == 0u && localBounce == 0) ? 14.0 * VPT_DIRECT_LIGHT_STRENGTH : VPT_INDIRECT_LIGHT_STRENGTH;
+        // Seen, a texel glows in proportion to its emissive value, not its square: the dim parts of glowstone
+        // between its bright specks glow too instead of going near black. The light cast keeps the square law.
+        float seenEmission = currentSurface.mat.emission;
+#if defined(VPT_EMISSION_MODEL) && VPT_EMISSION_MODEL != 0
+        if (bounce == 0u && localBounce == 0) { seenEmission = sqrt(max(seenEmission, 0.0)); }
+#endif
+        float blockEmissionWeight =
+            (localBounce == 0 && bounce > 0u && vptBlockLightAlreadyCounted(gl_WorldRayOriginEXT, currentSurface.worldPos)) ?
+                0.0 : 1.0;
+        vec3 emissionRadiance =
+            blockEmissionWeight * emissionFactor *
+            worldUBO.emissionBrightness *
+            ((bounce == 0u && localBounce == 0) ? currentSurface.tint : vptEmissiveColour(currentSurface.tint)) *
+            seenEmission * mainRay.throughput;
+        emissionRadiance += currentSurface.tint * albedoEmission * mainRay.throughput;
+        mainRay.radiance += emissionRadiance;
+
+        SampledSurface litSurface = currentSurface;
+        vec3 directLight =
+            sampleSurfaceDirectLight(litSurface, currentViewDir, textureUV, planeHitWorldPos, atlasUvMin, atlasUvMax,
+                                     dPduWorld, dPdvWorld, baseGeoNormal, traceLocalHeight,
+                                     textureMap.normal, maxDepthWorld, hasFftWaterSurface);
+        // The surface the camera sees first, straight or through glass: full block light sampling (and ReSTIR).
+        bool blockLightPrimary = rayBounce(mainRay) == 0u || rayCameraPath(mainRay);
+        // From the second bounce on, block lights are left to be found by the bounces themselves: what they add there is
+        // small and averaged away, and sampling them on every bounce cost as much as the rest of the light together.
+        // With Cache Deep Bounces (Bedrock-like), bounced surfaces leave block lights to the bounces and the cache too.
+        bool blockLightSkipped = !blockLightPrimary && (VPT_CACHE_DEEP_BOUNCES != 0 || rayBounce(mainRay) >= 2u);
+        vec3 blockLight = blockLightSkipped ? vec3(0.0) :
+                              sampleBlockLightAt(litSurface.worldPos, litSurface.geometricNormal,
+                                                 litSurface.shadingNormal, litSurface.mat, blockLightPrimary);
+        directLight += blockLight;
+        directLight += sampleHeldLight(litSurface.worldPos, litSurface.geometricNormal,
+                                       litSurface.shadingNormal, litSurface.mat);
+        if (localBounce == 0) { mainRay.directLightRadiance = directLight; }
+        mainRay.radiance += directLight;
+
+        bool isOpaqueSurface = currentSurface.mat.transmission <= EPS;
+        vec3 sampleDir;
+        float pdf;
+        uint lobeType;
+        vec3 bsdf;
+        if (isWaterMaterial && currentSurface.mat.transmission > EPS) {
+            vec3 incident = -currentViewDir;
+            vec3 waterNormal = currentSurface.shadingNormal;
+            vec3 waterUpNormal = waterNormal.y >= 0.0 ? waterNormal : -waterNormal;
+            float eta = dot(incident, waterUpNormal) < 0.0 ? (1.0 / currentSurface.mat.ior) : currentSurface.mat.ior;
+            float fresnel = clamp(vptInterfaceFresnel(abs(dot(currentViewDir, waterNormal)), eta), 0.0, 1.0);
+            vec3 refractionDir = refract(incident, waterNormal, eta);
+            // Seen from under the water, the surface is let through everywhere with a light cyan tint and little
+            // reflection, as in Bedrock RTX: physically only a circle overhead (Snell's window) shows the sky and
+            // the rest mirrors the water below, which read as a hole in a turquoise ceiling.
+            bool fromBelow = dot(incident, waterUpNormal) > 0.0;
+            if (fromBelow) {
+                refractionDir = normalize(mix(incident, waterUpNormal, 0.15));
+                fresnel = min(fresnel, 0.08);
+            }
+            bool hasRefraction = dot(refractionDir, refractionDir) > 1e-6;
+            bool chooseReflection = !hasRefraction ||
+                                    (VPT_TRANSPARENT_SPLIT_MODE != VPT_TRANSPARENT_SPLIT_MODE_DETERMINISTIC &&
+                                     rand(mainRay.seed) < fresnel);
+            if (chooseReflection) {
+                sampleDir = normalize(reflect(incident, waterNormal));
+                pdf = max(fresnel, 1e-4);
+                lobeType = 1u;
+                bsdf = vec3(fresnel);
+            } else {
+                sampleDir = normalize(refractionDir);
+                pdf = max(1.0 - fresnel, 1e-4);
+                lobeType = 2u;
+                // The water medium colours the water by depth, as Bedrock RTX does (a pack's own, or one made from
+                // the biome's water colour); the surface itself is clear.
+                vec3 surfaceTint = waterMediumActive() ? vec3(1.0) :
+                                                         pow(max(currentSurface.albedoValue.rgb, vec3(0.0)), vec3(0.5));
+                if (fromBelow) { surfaceTint *= vec3(0.85, 0.97, 1.0); }
+                bsdf = surfaceTint * (1.0 - fresnel);
+            }
+        } else {
+            bsdf = DisneySample(currentSurface.mat, currentViewDir, currentSurface.shadingNormal, sampleDir, pdf,
+                                mainRay.seed, lobeType);
+        }
+
+        // Leaving the water's surface, through it or off it. Off the top, down goes into the water and up out of it;
+        // through a side, the ray swaps sides.
+        if (isWaterMaterial) {
+            if (abs(baseGeoNormal.y) > 0.5) {
+                raySetInWater(mainRay, sampleDir.y < 0.0);
+            } else if (lobeType == 2u) {
+                raySetInWater(mainRay, !rayInWater(mainRay));
+            }
+        }
+
+        raySetBlockLightSampled(mainRay, worldUBO.blockLightSampling != 0u && !blockLightSkipped && lobeType == 0u &&
+                                             vptBlockLightDiffuseWeight(currentSurface.mat) > 1e-4);
+        raySetBlockLightLean(mainRay, !blockLightPrimary);
+
+        if (!storedLobeType) {
+            raySetLobeType(mainRay, lobeType);
+            raySetIndirectVolumetricCloud(mainRay,
+                                          vptShouldCaptureIndirectVolumetricCloud(lobeType, currentSurface.mat.roughness));
+            storedLobeType = true;
+        }
+        raySetNoisy(mainRay, true);
+
+        if (pdf <= 1e-6 || max(bsdf.r, max(bsdf.g, bsdf.b)) <= 1e-6) {
+            raySetStop(mainRay, true);
+            return;
+        }
+
+        if (isOpaqueSurface && dot(sampleDir, currentSurface.geometricNormal) <= 0.0) {
+            raySetStop(mainRay, true);
+            return;
+        }
+
+        vec3 throughputBefore = mainRay.throughput;
+        mainRay.throughput *= bsdf / max(pdf, 1e-4);
+        // Bedrock RTX fills a room from a single patch of sunlight: light off rough surfaces carries on stronger than
+        // their albedo alone lets it (VPT_BOUNCE_LIGHT_BOOST), kept under 0.95 a bounce so it still dies out.
+        if (lobeType == 0u && VPT_BOUNCE_LIGHT_BOOST > 1.0) {
+            vec3 ratio = mainRay.throughput / max(throughputBefore, vec3(1e-6));
+            float bounceAlbedo = max(ratio.r, max(ratio.g, ratio.b));
+            mainRay.throughput *= clamp(0.95 / max(bounceAlbedo, 1e-3), 1.0, VPT_BOUNCE_LIGHT_BOOST);
+        }
+
+        if (!traceLocalHeight) {
+            if (hasFftWaterSurface) {
+                vec3 exitNormal = dot(sampleDir, currentSurface.geometricNormal) >= 0.0 ? currentSurface.geometricNormal :
+                                                                                           -currentSurface.geometricNormal;
+                mainRay.origin = currentSurface.worldPos + exitNormal * VPT_FFT_WATER_ORIGIN_BIAS;
+            } else if (hasHeightMapSurface) {
+                vec3 exitBasePos =
+                    basePlaneWorldPosAtUv(currentSurface.uv, textureUV, planeHitWorldPos, dPduWorld, dPdvWorld);
+                vec3 exitNormal = dot(sampleDir, baseGeoNormal) >= 0.0 ? baseGeoNormal : -baseGeoNormal;
+                mainRay.origin = exitBasePos + exitNormal * 0.0002;
+            } else {
+                vec3 exitNormal = dot(sampleDir, currentSurface.geometricNormal) >= 0.0 ? currentSurface.geometricNormal :
+                                                                                           -currentSurface.geometricNormal;
+                mainRay.origin = currentSurface.worldPos + exitNormal * 0.0002;
+            }
+            mainRay.direction = sampleDir;
+            raySetStop(mainRay, false);
+            return;
+        }
+
+        HeightMapHit localBounceHit;
+        vec2 exitUv;
+        float exitDepth;
+        float exitDistance;
+        bool localBlocked = traceLocalHeightIntersectionAndExit(
+            textureMap.normal, atlasUvMin, atlasUvMax, dPduWorld, dPdvWorld, baseGeoNormal, maxDepthWorld,
+            currentSurface, sampleDir, VPT_PARALLAX_SECONDARY_MAX_STEPS, localBounceHit, exitUv, exitDepth,
+            exitDistance);
+        if (!localBlocked) {
+            vec3 exitBasePos =
+                basePlaneWorldPosAtUv(exitUv, textureUV, planeHitWorldPos, dPduWorld, dPdvWorld) -
+                baseGeoNormal * exitDepth;
+            vec3 exitGeoNormal =
+                localBounceHit.sideWall && localBounceHit.edgeWall ? localBounceHit.geometricNormal : baseGeoNormal;
+            vec3 exitNormal = dot(sampleDir, exitGeoNormal) >= 0.0 ? exitGeoNormal : -exitGeoNormal;
+            mainRay.origin = exitBasePos + exitNormal * 0.0002;
+            mainRay.direction = sampleDir;
+            raySetStop(mainRay, false);
+            return;
+        }
+
+        vec3 nextWorldPos = currentSurface.worldPos + sampleDir * localBounceHit.t;
+        sampleSurfaceState(useTexture, textureID, textureMap, atlasUvMin, atlasUvMax, localBounceHit.uv, lod, alphaMode,
+                           colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld, dPdvWorld,
+                           baseGeoNormal, hasHeightMapSurface, maxDepthWorld, localBounceHit, nextWorldPos, -sampleDir,
+                           isWaterMaterial, hasFftWaterSurface, currentSurface);
+        currentViewDir = -sampleDir;
+    }
+
+    raySetStop(mainRay, true);
+}

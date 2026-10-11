@@ -1,0 +1,198 @@
+#version 460
+#define NUM_BINS 256
+
+layout(set = 0, binding = 0) uniform sampler2D uHdr;
+
+layout(set = 0, binding = 1) buffer HistogramBuffer {
+    uint bins[NUM_BINS];
+}
+gHist;
+
+layout(set = 0, binding = 2) buffer ExposureBuffer {
+    float exposure;
+    float avgLogLum;
+    float padding0;
+    float padding1;
+}
+expData;
+
+// The incident light meter written by the ray tracer: per sample the cube root of a white surface's brightness under
+// the light there, and the sample's weight.
+layout(set = 0, binding = 5) buffer LightMeterBuffer {
+    vec4 samples[256];
+    vec4 daylight;
+}
+lightMeter;
+
+layout(push_constant) uniform PushConstant {
+    float log2Min;
+    float log2Max;
+    float epsilon;
+    float lowPercent;
+    float highPercent;
+    float middleGrey;
+    float dt;
+    float speedUp;
+    float speedDown;
+    float minExposure;
+    float maxExposure;
+    float manualExposure;
+    float exposureBias;
+    float whitePoint;
+    float saturation;
+    int toneMappingMethod;
+    int autoExposure;
+    int clampOutput;
+    int exposureMeteringMode;
+    float centerMeteringPercent;
+    float adaptation;
+    float padding1;
+    float padding2;
+}
+pc;
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// Bedrock-style light meter (metering mode 2), an independent approximation of its observed behaviour:
+// a 16 x 16 grid of samples over the picture, averaged per colour
+// channel as the cube of the mean cube root (a power mean that a few very bright samples barely move), the brightest
+// channel of that taken as the scene's level. Bedrock meters incident light and brings a white surface to 0.75;
+// Radiante meters the picture itself, so the target is middle grey (0.75 times an average albedo of about a
+// quarter: INFERRED).
+const uint METER_GRID = 16u;
+
+float meterLevel() {
+    ivec2 size = textureSize(uHdr, 0);
+    vec3 sum = vec3(0.0);
+    for (uint y = 0u; y < METER_GRID; y++) {
+        for (uint x = 0u; x < METER_GRID; x++) {
+            ivec2 p = ivec2((vec2(x, y) + 0.5) / float(METER_GRID) * vec2(size));
+            vec3 c = max(texelFetch(uHdr, p, 0).rgb, vec3(0.0));
+            vec3 root = exp2(log2(max(c, vec3(1e-12))) / 3.0);
+            sum += any(isnan(root)) || any(isinf(root)) ? vec3(0.0) : root;
+        }
+    }
+    vec3 level = pow(sum / float(METER_GRID * METER_GRID), vec3(3.0));
+    return max(level.r, max(level.g, level.b));
+}
+
+// Metering mode "incident": the power mean (p = 1/3) of the light reaching the surfaces in view, the brightest channel
+// of it, and an exposure that brings a white surface under that light to 0.75 - Bedrock RTX's rule. The sky and the
+// colour of the blocks do not move it, so a bright window or a dark wall in view leaves a room's exposure alone.
+// Returns false when too few surfaces were seen (open sky), and the exposure is then kept.
+bool incidentExposure(out float target) {
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (uint i = 0u; i < 256u; i++) {
+        vec4 s = lightMeter.samples[i];
+        sum += s.rgb * s.a;
+        weight += s.a;
+    }
+    target = 0.0;
+    if (weight < 4.0) { return false; }
+    vec3 level = pow(sum / weight, vec3(3.0));
+    float m = max(level.r, max(level.g, level.b));
+    // 0.75 for white, on the scale the other modes use for middle grey (0.18 by default).
+    target = 0.75 * (pc.middleGrey / 0.18) / max(m, 1e-6);
+    return true;
+}
+
+void main() {
+    uint total = 0u;
+    for (uint i = 0u; i < NUM_BINS; ++i) total += gHist.bins[i];
+
+    float prev = expData.exposure;
+    if (isnan(prev) || isinf(prev) || prev <= 0.0) { prev = clamp(pc.manualExposure, pc.minExposure, pc.maxExposure); }
+
+    if (pc.exposureMeteringMode == 2 || pc.exposureMeteringMode == 3) {
+        float level = meterLevel();
+        float targetExposure = pc.middleGrey / max(level, 1e-6);
+        // Incident light when enough surfaces are in view; the picture's own level otherwise (open sky).
+        float incidentTarget;
+        if (pc.exposureMeteringMode == 3 && incidentExposure(incidentTarget)) { targetExposure = incidentTarget; }
+        // The eye opens far only by day: at night it stops at 0.6, a night about as dark as Bedrock RTX's, however
+        // high the day's limit is set.
+        float maxExposure = pc.maxExposure;
+        if (pc.exposureMeteringMode == 3) {
+            float day = clamp(lightMeter.daylight.x, 0.0, 1.0);
+            maxExposure = exp2(mix(log2(min(pc.maxExposure, 0.6)), log2(max(pc.maxExposure, 1e-6)), day));
+            // A dimension meant to look darker than the meter would make it (the End).
+            float darkness = clamp(lightMeter.daylight.y, 0.05, 1.0);
+            targetExposure *= darkness;
+            maxExposure *= darkness;
+            // Under the meter's level: nearly half the light off by day, a quarter at night.
+            float dim = mix(0.75, 0.55, day);
+            targetExposure *= dim;
+            maxExposure *= dim;
+        }
+        float anchor = clamp(pc.manualExposure, pc.minExposure, maxExposure);
+        targetExposure = exp2(mix(log2(anchor), log2(max(targetExposure, 1e-6)), clamp(pc.adaptation, 0.0, 1.0)));
+        float speed = (targetExposure > prev) ? pc.speedUp : pc.speedDown;
+        if (pc.exposureMeteringMode == 3) {
+            // The incident meter reads 256 one-sample points of the path tracer's light, noisy from frame to frame:
+            // followed at full speed the picture's brightness shimmered. Changes under a tenth of a stop are left
+            // alone, and larger ones are followed at a third of the speed - an eye still, a scene change still felt.
+            float stops = log2(max(targetExposure, 1e-6)) - log2(max(prev, 1e-6));
+            if (abs(stops) < 0.1) { targetExposure = prev; }
+            speed *= 0.35;
+        }
+        float k = 1.0 - exp(-pc.dt * speed);
+        expData.avgLogLum = log2(max(level, 1e-12));
+        expData.exposure = clamp(mix(prev, targetExposure, clamp(k, 0.0, 1.0)), pc.minExposure, maxExposure);
+        return;
+    }
+
+    if (total == 0u) {
+        expData.avgLogLum = pc.log2Min;
+        expData.exposure = clamp(prev, pc.minExposure, pc.maxExposure);
+        return;
+    }
+
+    float fTotal = float(total);
+    uint lowCount = uint(clamp(pc.lowPercent, 0.0, 1.0) * fTotal);
+    uint highCount = uint(clamp(pc.highPercent, 0.0, 1.0) * fTotal);
+    if (highCount <= lowCount) highCount = lowCount + 1u;
+
+    uint cumulative = 0u;
+    double sumLog = 0.0;
+    uint used = 0u;
+
+    float binCountF = float(NUM_BINS);
+    float log2Range = pc.log2Max - pc.log2Min;
+
+    for (uint i = 0u; i < NUM_BINS; ++i) {
+        uint c = gHist.bins[i];
+        if (c == 0u) continue;
+
+        uint next = cumulative + c;
+
+        uint a = max(cumulative, lowCount);
+        uint b = min(next, highCount);
+        if (b > a) {
+            uint take = b - a;
+
+            float t = (float(i) + 0.5) / binCountF;
+            float logLum = pc.log2Min + t * log2Range;
+
+            sumLog += double(logLum) * double(take);
+            used += take;
+        }
+        cumulative = next;
+        if (cumulative >= highCount) break;
+    }
+
+    float avgLogLum = (used > 0u) ? float(sumLog / double(used)) : pc.log2Min;
+    float avgLum = exp2(avgLogLum);
+
+    float targetExposure = pc.middleGrey / max(avgLum, 1e-6);
+    // Only part of the way, as an eye (and Bedrock RTX) does: a dark room stays darker than a sunlit field, around
+    // the exposure held for a scene of no particular brightness (manualExposure).
+    float anchor = clamp(pc.manualExposure, pc.minExposure, pc.maxExposure);
+    targetExposure = exp2(mix(log2(anchor), log2(max(targetExposure, 1e-6)), clamp(pc.adaptation, 0.0, 1.0)));
+    float speed = (targetExposure > prev) ? pc.speedUp : pc.speedDown;
+    float k = 1.0 - exp(-pc.dt * speed);
+    float adapted = mix(prev, targetExposure, clamp(k, 0.0, 1.0));
+
+    expData.avgLogLum = avgLogLum;
+    expData.exposure = clamp(adapted, pc.minExposure, pc.maxExposure);
+}
