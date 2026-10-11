@@ -51,7 +51,8 @@
     "world.LevelRendererMixin",
     "world.LevelRendererSkipMixin",
     "world.SectionDirtyStateMixin",
-    "world.SectionUpdateTrackerMixin"
+    "world.SectionUpdateTrackerMixin",
+    "world.TerrainDrawSkipMixin"
   ],
   "injectors": {
     "defaultRequire": 1
