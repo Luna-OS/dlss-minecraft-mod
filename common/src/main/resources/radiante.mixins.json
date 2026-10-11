@@ -10,6 +10,7 @@
     "compat.DistantHorizonsRenderBuildMixin",
     "compat.DistantHorizonsRenderSkipMixin",
     "compat.DistantHorizonsShutdownMixin",
+    "compat.SodiumSectionUpdatesMixin",
     "backend.FailedStartFallbackMixin",
     "backend.HdrPresentMixin",
     "backend.PreferredGraphicsApiMixin",
@@ -50,7 +51,8 @@
     "world.LevelRendererMixin",
     "world.LevelRendererSkipMixin",
     "world.SectionDirtyStateMixin",
-    "world.SectionUpdateTrackerMixin"
+    "world.SectionUpdateTrackerMixin",
+    "world.TerrainDrawSkipMixin"
   ],
   "injectors": {
     "defaultRequire": 1
