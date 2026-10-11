@@ -1,3 +1,25 @@
+# Radiante (Luna Fork)
+
+> **This is a fork of [Radiante](https://github.com/Gabrieli2806/Radiante-26.3-Fabric) by
+> [Gabrieli2806](https://github.com/Gabrieli2806)**, itself a fork of
+> [Radiance](https://github.com/Minecraft-Radiance/Radiance) / [MCVR](https://github.com/Minecraft-Radiance/MCVR) by
+> LJIONG and Interstellarss. All credit for the renderer goes to them; please report problems with this fork
+> [here](https://github.com/Luna-OS/dlss-minecraft-mod/issues), not upstream.
+>
+> **Goal of the fork:** compatibility with a fixed set of other Fabric mods (Sodium, Distant Horizons, Xaero's
+> maps, EMF/ETF and others), and a clear in-game message instead of a crash when mods that need OpenGL (Iris,
+> Nvidium) are installed (work in progress, see the pull requests). It has its own mod ID, `radiante-luna` (name "Radiante (Luna Fork)"), and declares
+> `provides: radiante`, so it cannot be installed together with the original. Only the Fabric build is maintained
+> here; the NeoForge and Forge modules are inherited from upstream unchanged.
+>
+> **Licence:** GPL-3.0 like upstream ([LICENSE](LICENSE)), with the same additional permission for the DLSS, Streamline,
+> Reflex and XeSS libraries ([LICENSE-EXCEPTION.md](LICENSE-EXCEPTION.md)), which this fork extends to its own changes.
+> The third-party licences in `common/src/main/resources/licenses/` are kept unchanged.
+
+The rest of this README is upstream's.
+
+---
+
 # Radiante
 
 Path-traced rendering for Minecraft 26.3 (Fabric, NeoForge and Forge), built on Minecraft's own Vulkan backend.
