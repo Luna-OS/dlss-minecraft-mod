@@ -1,0 +1,260 @@
+#ifndef RAY_GLSL
+#define RAY_GLSL
+
+#include "util/ray_payloads.glsl"
+
+#if defined(VPT_MATERIAL_STATE_BINDING)
+layout(set = 5, binding = VPT_MATERIAL_STATE_BINDING, rgba16f) uniform image2DArray rayMaterialStateImage;
+#else
+layout(set = 5, binding = 7, rgba16f) uniform image2DArray rayMaterialStateImage;
+#endif
+
+// Shadow rays: the first blocker ends the ray, and the shadow hit group has no closest-hit work to do.
+#define VPT_SHADOW_RAY_FLAGS (gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT)
+
+const uint rayBounceMask = 0xFFu;
+const uint rayInsideBoatBit = 1u << 8u;
+const uint rayStopBit = 1u << 9u;
+const uint rayContinueBit = 1u << 10u;
+const uint rayNoisyBit = 1u << 11u;
+const uint rayLobeShift = 12u;
+const uint rayLobeMask = 0x3u << rayLobeShift;
+const uint raySkipFogBit = 1u << 14u;
+const uint rayIgnoreWaterSelfBit = 1u << 15u;
+const uint rayCaptureSurfaceBit = 1u << 16u;
+const uint raySurfaceCacheWrittenBit = 1u << 17u;
+const uint raySurfaceCacheTargetSecondaryBit = 1u << 18u;
+const uint rayIndirectVolumetricCloudBit = 1u << 19u;
+// The surface this ray left took its block light by sampling the light list, and the ray left through the diffuse
+// lobe: a light it now hits was already counted there. Kept across bounces (resetMainRay leaves it alone).
+const uint rayBlockLightSampledBit = 1u << 20u;
+// Set by a surface the primary ray passes through unseen (a see-through parallax edge): the depth the denoisers
+// get must come from what is visible behind it, not from it.
+const uint rayPassThroughBit = 1u << 21u;
+// The ray travels through water: the next surface it reaches is seen through the water in between. Kept across
+// bounces, and switched by the water surface the ray refracts through.
+const uint rayInWaterBit = 1u << 22u;
+// Still the camera's own ray: so far it has only passed through see-through surfaces (clear glass, sheets of water).
+// The back face of a glass block or the second side of a pane is then seen through as the first one was, not shaded
+// as a mirror that reflected the outside back into the view.
+const uint rayCameraPathBit = 1u << 23u;
+
+// The surface this ray left sampled block lights only in the eight sections nearest it (bounced light), not all 27
+// around it: a light it now hits outside those was not counted there. See block_light.glsl.
+const uint rayBlockLightLeanBit = 1u << 24u;
+
+void raySetBlockLightLean(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayBlockLightLeanBit) : (ray.stateBits & ~rayBlockLightLeanBit);
+}
+
+bool rayBlockLightLean(MainRay ray) {
+    return (ray.stateBits & rayBlockLightLeanBit) != 0u;
+}
+
+void raySetCameraPath(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayCameraPathBit) : (ray.stateBits & ~rayCameraPathBit);
+}
+
+bool rayCameraPath(MainRay ray) {
+    return (ray.stateBits & rayCameraPathBit) != 0u;
+}
+
+ivec3 rayMaterialStateCoord(int layer) {
+    return ivec3(ivec2(gl_LaunchIDEXT.xy), layer);
+}
+
+void raySetBounce(inout MainRay ray, uint bounce) {
+    ray.stateBits = (ray.stateBits & ~rayBounceMask) | (bounce & rayBounceMask);
+}
+
+uint rayBounce(MainRay ray) {
+    return ray.stateBits & rayBounceMask;
+}
+
+void raySetInsideBoat(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayInsideBoatBit) : (ray.stateBits & ~rayInsideBoatBit);
+}
+
+bool rayInsideBoat(MainRay ray) {
+    return (ray.stateBits & rayInsideBoatBit) != 0u;
+}
+
+void raySetStop(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayStopBit) : (ray.stateBits & ~rayStopBit);
+}
+
+bool rayShouldStop(MainRay ray) {
+    return (ray.stateBits & rayStopBit) != 0u;
+}
+
+void raySetContinue(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayContinueBit) : (ray.stateBits & ~rayContinueBit);
+}
+
+bool rayShouldContinue(MainRay ray) {
+    return (ray.stateBits & rayContinueBit) != 0u;
+}
+
+void raySetNoisy(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayNoisyBit) : (ray.stateBits & ~rayNoisyBit);
+}
+
+bool rayIsNoisy(MainRay ray) {
+    return (ray.stateBits & rayNoisyBit) != 0u;
+}
+
+void raySetSkipFog(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | raySkipFogBit) : (ray.stateBits & ~raySkipFogBit);
+}
+
+bool raySkipFog(MainRay ray) {
+    return (ray.stateBits & raySkipFogBit) != 0u;
+}
+
+void raySetIgnoreWaterSelf(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayIgnoreWaterSelfBit) : (ray.stateBits & ~rayIgnoreWaterSelfBit);
+}
+
+bool rayIgnoreWaterSelf(MainRay ray) {
+    return (ray.stateBits & rayIgnoreWaterSelfBit) != 0u;
+}
+
+void raySetCaptureSurface(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayCaptureSurfaceBit) : (ray.stateBits & ~rayCaptureSurfaceBit);
+}
+
+bool rayCaptureSurface(MainRay ray) {
+    return (ray.stateBits & rayCaptureSurfaceBit) != 0u;
+}
+
+void raySetSurfaceCacheWritten(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | raySurfaceCacheWrittenBit) :
+                              (ray.stateBits & ~raySurfaceCacheWrittenBit);
+}
+
+bool raySurfaceCacheWritten(MainRay ray) {
+    return (ray.stateBits & raySurfaceCacheWrittenBit) != 0u;
+}
+
+void raySetSurfaceCacheTargetSecondary(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | raySurfaceCacheTargetSecondaryBit) :
+                              (ray.stateBits & ~raySurfaceCacheTargetSecondaryBit);
+}
+
+bool raySurfaceCacheTargetSecondary(MainRay ray) {
+    return (ray.stateBits & raySurfaceCacheTargetSecondaryBit) != 0u;
+}
+
+void raySetIndirectVolumetricCloud(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayIndirectVolumetricCloudBit) :
+                              (ray.stateBits & ~rayIndirectVolumetricCloudBit);
+}
+
+bool rayUseIndirectVolumetricCloud(MainRay ray) {
+    return (ray.stateBits & rayIndirectVolumetricCloudBit) != 0u;
+}
+
+void raySetLobeType(inout MainRay ray, uint lobeType) {
+    ray.stateBits = (ray.stateBits & ~rayLobeMask) | ((lobeType & 0x3u) << rayLobeShift);
+}
+
+void raySetBlockLightSampled(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayBlockLightSampledBit) : (ray.stateBits & ~rayBlockLightSampledBit);
+}
+
+void raySetPassThrough(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayPassThroughBit) : (ray.stateBits & ~rayPassThroughBit);
+}
+
+void raySetInWater(inout MainRay ray, bool enabled) {
+    ray.stateBits = enabled ? (ray.stateBits | rayInWaterBit) : (ray.stateBits & ~rayInWaterBit);
+}
+
+bool rayInWater(MainRay ray) {
+    return (ray.stateBits & rayInWaterBit) != 0u;
+}
+
+bool rayIsPassThrough(MainRay ray) {
+    return (ray.stateBits & rayPassThroughBit) != 0u;
+}
+
+bool rayBlockLightSampled(MainRay ray) {
+    return (ray.stateBits & rayBlockLightSampledBit) != 0u;
+}
+
+// Put in a ray's pad0 before it is traced, for the miss shader (hits write their own data there): the ray is what
+// the camera sees off or through a surface - a reflection, a refraction - and not light gathered for one.
+const uint RAY_VIEW_BOUNCE_MARK = 1u;
+
+// Minecraft's textures and tints are stored for the screen (sRGB), not as how much light a surface returns. Lit as
+// they are stored, everything came out pale and flat: dark planks a light cream, grass a washed yellow-green, with
+// little difference between a dark block and a bright one. Raised to this power they are (close to) the linear
+// colour the lighting expects; 2.2 is the full conversion, 1.0 the stored value untouched.
+#ifndef VPT_ALBEDO_GAMMA
+#    define VPT_ALBEDO_GAMMA 2.2
+#endif
+// Bedrock compatibility - observed behaviour. Bedrock RTX turns
+// the colour texture into linear light with the exact piecewise sRGB curve, not a power. Off by default (the power
+// above stays Radiante's own look); the Bedrock RTX profile switches it on.
+#ifndef VPT_ALBEDO_SRGB_EXACT
+#    define VPT_ALBEDO_SRGB_EXACT 0
+#endif
+vec3 vptSurfaceColour(vec3 stored) {
+    stored = max(stored, vec3(0.0));
+#if VPT_ALBEDO_SRGB_EXACT != 0
+    vec3 high = pow((stored + 0.055) / 1.055, vec3(2.4));
+    return mix(stored / 12.92, high, greaterThan(stored, vec3(0.04045)));
+#else
+    return pow(stored, vec3(VPT_ALBEDO_GAMMA));
+#endif
+}
+
+uint rayLobeType(MainRay ray) {
+    return (ray.stateBits & rayLobeMask) >> rayLobeShift;
+}
+
+void rayClearMaterial(inout MainRay ray) {
+    imageStore(rayMaterialStateImage, rayMaterialStateCoord(0), vec4(0.0));
+    imageStore(rayMaterialStateImage, rayMaterialStateCoord(1), vec4(0.0));
+    imageStore(rayMaterialStateImage, rayMaterialStateCoord(2), vec4(0.0));
+}
+
+void rayStoreMaterial(inout MainRay ray,
+                       vec4 albedoValue,
+                       vec3 f0,
+                       float roughness,
+                       float metallic,
+                       float transmission,
+                       float ior,
+                       float emission) {
+    imageStore(rayMaterialStateImage, rayMaterialStateCoord(0), albedoValue);
+    imageStore(rayMaterialStateImage, rayMaterialStateCoord(1), vec4(f0, roughness));
+    imageStore(rayMaterialStateImage, rayMaterialStateCoord(2), vec4(metallic, transmission, ior, emission));
+}
+
+void rayStoreAux(inout MainRay ray, vec2 aux) {
+    ray.pad0 = packHalf2x16(aux);
+}
+
+vec2 rayLoadAux(MainRay ray) {
+    return unpackHalf2x16(ray.pad0);
+}
+
+MaterialInfo rayLoadMaterial(MainRay ray) {
+    MaterialInfo mat;
+    memoryBarrierImage();
+    vec4 albedoValue = imageLoad(rayMaterialStateImage, rayMaterialStateCoord(0));
+    vec4 f0Roughness = imageLoad(rayMaterialStateImage, rayMaterialStateCoord(1));
+    vec4 materialValues = imageLoad(rayMaterialStateImage, rayMaterialStateCoord(2));
+
+    mat.albedoValue = albedoValue;
+    mat.f0 = f0Roughness.rgb;
+    mat.roughness = f0Roughness.a;
+    mat.metallic = materialValues.x;
+    mat.transmission = materialValues.y;
+    mat.ior = materialValues.z;
+    mat.emission = materialValues.w;
+    return mat;
+}
+
+#endif

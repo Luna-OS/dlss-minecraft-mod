@@ -1,0 +1,148 @@
+#pragma once
+
+#include "common/shared.hpp"
+#include "common/singleton.hpp"
+#include "core/all_extern.hpp"
+#include "core/vulkan/all_core_vulkan.hpp"
+
+#include <atomic>
+#include <functional>
+#include <map>
+
+struct WorldPipelineBuildParams {
+    int moduleCount;
+    int padding;
+    char **moduleNames;
+    int *imageFormats;
+    int **inputIndices;
+    int **outputIndices;
+    int *attributeCounts;
+    char*** attributeKVs;
+};
+
+class Framework;
+class FrameworkContext;
+class WorldModule;
+class WorldModuleContext;
+class ShaderPack;
+
+class WorldPipeline;
+struct WorldPipelineContext;
+
+class Pipeline;
+struct PipelineContext;
+
+class WorldPipelineBlueprint : public SharedObject<WorldPipelineBlueprint> {
+    friend WorldPipeline;
+
+  public:
+    WorldPipelineBlueprint(WorldPipelineBuildParams *params);
+
+  private:
+    std::vector<std::string> moduleNames_;
+    std::vector<std::vector<uint32_t>> modulesInputIndices_;
+    std::vector<std::vector<uint32_t>> modulesOutputIndices_;
+    std::vector<VkFormat> imageFormats_;
+    std::vector<uint32_t> attributeCounts_;
+    std::vector<std::vector<std::string>> attributeKVs_;
+};
+
+class WorldPipeline : public SharedObject<WorldPipeline> {
+    friend WorldPipelineContext;
+    friend WorldPipelineBlueprint;
+
+  public:
+    WorldPipeline();
+
+    void init(std::shared_ptr<Framework> framework, std::shared_ptr<Pipeline> pipeline);
+
+    std::vector<std::shared_ptr<WorldModule>> &worldModules();
+    // Image the pipeline blueprint assigned to `index` for the frame slot, or null when there is none.
+    std::shared_ptr<vk::DeviceLocalImage> sharedImage(uint32_t frameIndex, uint32_t index);
+    std::vector<std::shared_ptr<WorldPipelineContext>> &contexts();
+    std::shared_ptr<ShaderPack> shaderPack();
+
+    void bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index);
+
+  private:
+    void dumpSharedImages(const char *label) const;
+
+    std::vector<std::shared_ptr<WorldModule>> worldModules_;
+    std::vector<std::vector<std::shared_ptr<vk::DeviceLocalImage>>> sharedImages_;
+    std::shared_ptr<ShaderPack> shaderPack_;
+
+    std::vector<std::shared_ptr<WorldPipelineContext>> contexts_;
+};
+
+struct WorldPipelineContext : public SharedObject<WorldPipelineContext> {
+    std::weak_ptr<FrameworkContext> frameworkContext;
+    std::weak_ptr<WorldPipeline> worldPipeline;
+
+    std::shared_ptr<vk::DeviceLocalImage> outputImage;
+    std::vector<std::shared_ptr<WorldModuleContext>> worldModuleContexts;
+
+    WorldPipelineContext(std::shared_ptr<FrameworkContext> frameworkContext,
+                         std::shared_ptr<WorldPipeline> worldPipeline);
+
+    void render();
+};
+
+class Pipeline : public SharedObject<Pipeline> {
+    friend PipelineContext;
+
+  public:
+    static std::map<
+        std::string,
+        std::function<std::shared_ptr<WorldModule>(std::shared_ptr<Framework>, std::shared_ptr<WorldPipeline>)>>
+        worldModuleConstructors;
+    static std::map<std::string, std::pair<uint32_t, uint32_t>> worldModuleInOutImageNums;
+    static std::map<std::string, std::function<void()>> worldModuleStaticPreCloser;
+    static void collectWorldModules();
+    static void beginNativeRebuild();
+    static void endNativeRebuild();
+    static bool nativeRebuildActive();
+    // Shaders compiled so far in the rebuild under way, and how many it needs: for the progress shown to the player.
+    static std::atomic<uint32_t> rebuildShadersDone;
+    static std::atomic<uint32_t> rebuildShadersTotal;
+    // The same for the passes whose pipelines are created after the shaders (the driver compiles them, slowly).
+    static std::atomic<uint32_t> rebuildPassesDone;
+    static std::atomic<uint32_t> rebuildPassesTotal;
+
+  public:
+    Pipeline();
+    ~Pipeline();
+
+    void init(std::shared_ptr<Framework> framework);
+    void buildWorldPipelineBlueprint(WorldPipelineBuildParams *params);
+    void recreate(std::shared_ptr<Framework> framework);
+    void close();
+    std::shared_ptr<PipelineContext> acquirePipelineContext(std::shared_ptr<FrameworkContext> context);
+    std::vector<std::shared_ptr<PipelineContext>> &contexts();
+    void bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index);
+
+    std::shared_ptr<WorldPipeline> worldPipeline();
+
+    std::shared_ptr<WorldPipelineBlueprint> worldPipelineBlueprint();
+
+    bool isRecreationNeeded = false;
+
+  private:
+    static std::atomic<bool> nativeRebuildActive_;
+
+    std::weak_ptr<Framework> framework_;
+
+    std::shared_ptr<WorldPipeline> worldPipeline_;
+
+    std::shared_ptr<WorldPipelineBlueprint> worldPipelineBlueprint_;
+
+    std::shared_ptr<std::vector<std::shared_ptr<PipelineContext>>> contexts_;
+};
+
+struct PipelineContext : public SharedObject<PipelineContext> {
+    std::weak_ptr<FrameworkContext> frameworkContext;
+
+    std::shared_ptr<WorldPipelineContext> worldPipelineContext;
+
+    PipelineContext(std::shared_ptr<FrameworkContext> context, std::shared_ptr<Pipeline> pipeline);
+
+};
