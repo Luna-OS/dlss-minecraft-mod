@@ -1,0 +1,17 @@
+{
+  "options.radiante.unavailable.opengl_mods": "Radiante ist aus, weil das Spiel für %s mit OpenGL läuft. Klicken, um zurück zu Raytracing (Vulkan) zu wechseln.",
+  "screen.radiante.graphics_mode.title.vulkan": "Raytracing (Vulkan) ist aktiv",
+  "screen.radiante.graphics_mode.title.opengl": "Shader-Modus (OpenGL) ist aktiv",
+  "screen.radiante.graphics_mode.message.vulkan": "%s ist installiert, funktioniert aber nur mit OpenGL und ist deshalb in diesem Start aus. Radiante läuft mit Vulkan.\n\nBeides gleichzeitig geht nicht: Minecraft startet entweder mit Vulkan (Radiante) oder mit OpenGL (Iris-Shader, Nvidium). Umschalten braucht einen Neustart.",
+  "screen.radiante.graphics_mode.message.opengl": "Das Spiel läuft mit OpenGL, damit %s funktioniert. Radiante ist deshalb in diesem Start aus.\n\nBeides gleichzeitig geht nicht: Minecraft startet entweder mit Vulkan (Radiante) oder mit OpenGL (Iris-Shader, Nvidium). Umschalten braucht einen Neustart. Diesen Bildschirm öffnest du jederzeit wieder mit der Radiante-Taste (F6).",
+  "screen.radiante.graphics_mode.switch.opengl": "Stattdessen %s nutzen (OpenGL)",
+  "screen.radiante.graphics_mode.switch.vulkan": "Stattdessen Raytracing nutzen (Vulkan)",
+  "screen.radiante.graphics_mode.continue": "Weiter",
+  "screen.radiante.graphics_mode.hide": "Beim Start nicht mehr anzeigen",
+  "screen.radiante.graphics_mode.change.vulkan": "Grafik-API: Vulkan (Radiante-Raytracing)",
+  "screen.radiante.graphics_mode.change.opengl": "Grafik-API: OpenGL (%s)",
+  "options.radiante.restart.title": "Neustart nötig",
+  "options.radiante.restart.message": "Diese Änderungen gelten ab dem nächsten Spielstart:",
+  "options.radiante.restart.quit": "Spiel jetzt schließen",
+  "options.radiante.restart.later": "Später"
+}

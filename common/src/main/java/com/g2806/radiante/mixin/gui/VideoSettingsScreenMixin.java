@@ -1,5 +1,7 @@
 package com.g2806.radiante.mixin.gui;
 
+import com.g2806.radiante.client.compat.OpenGlMods;
+import com.g2806.radiante.client.gui.GraphicsModeScreen;
 import com.g2806.radiante.client.gui.RadianteOptionsScreen;
 import com.g2806.radiante.client.render.RadianteRenderer;
 import net.minecraft.client.Options;
@@ -35,7 +37,13 @@ public abstract class VideoSettingsScreenMixin extends OptionsSubScreen {
 
         // The button stays on the screen when ray tracing cannot run, greyed out and carrying the reason, so the
         // settings do not simply vanish with no explanation of where they went.
-        if (!RadianteRenderer.isActive()) {
+        if (OpenGlMods.anyInstalled() && !OpenGlMods.runningOnVulkan()) {
+            // On OpenGL for Iris or Nvidium: the button leads to the switch back to ray tracing.
+            button = Button.builder(RadianteOptionsScreen.TITLE,
+                ignored -> this.minecraft.gui.setScreen(new GraphicsModeScreen(self))).build();
+            button.setTooltip(Tooltip.create(Component.translatable("options.radiante.unavailable.opengl_mods",
+                OpenGlMods.names())));
+        } else if (!RadianteRenderer.isActive()) {
             // Two very different reasons look the same from here, and blaming the graphics card when the game is
             // simply running on OpenGL would send someone hunting for a driver problem they do not have.
             boolean onOpenGl = com.g2806.radiante.client.option.Options.useOpenGl
