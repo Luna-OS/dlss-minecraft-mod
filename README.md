@@ -12,6 +12,10 @@
 > `provides: radiante`, so it cannot be installed together with the original. Only the Fabric build is maintained
 > here; the NeoForge and Forge modules are inherited from upstream unchanged.
 >
+> **Iris and Nvidium:** they can stay installed, but they only work on OpenGL and Radiante only on Vulkan, so only
+> one side runs per start. With Iris installed the game starts on OpenGL unless Vulkan was chosen; a screen on the
+> title menu (and the F6 key) says which side is active and switches with a restart.
+>
 > **Licence:** GPL-3.0 like upstream ([LICENSE](LICENSE)), with the same additional permission for the DLSS, Streamline,
 > Reflex and XeSS libraries ([LICENSE-EXCEPTION.md](LICENSE-EXCEPTION.md)), which this fork extends to its own changes.
 > The third-party licences in `common/src/main/resources/licenses/` are kept unchanged.
