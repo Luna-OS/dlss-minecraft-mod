@@ -183,12 +183,12 @@ jobs:
           awk -v v="${{ needs.version.outputs.mod }}" '
             /^## / { if (found) exit; if (index($0, "[" v "]")) { found = 1; next } }
             found { print }' changelog.md > notes.md || true
-          test -s notes.md || echo "Radiante ${{ needs.version.outputs.mod }}" > notes.md
+          test -s notes.md || echo "Radiante (Luna Fork) ${{ needs.version.outputs.mod }}" > notes.md
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: Radiante ${{ needs.version.outputs.tag }}
+          name: Radiante (Luna Fork) ${{ needs.version.outputs.tag }}
           body_path: notes.md
           files: dist/*.jar
 
@@ -224,7 +224,7 @@ jobs:
           awk -v v="${{ needs.version.outputs.mod }}" '
             /^## / { if (found) exit; if (index($0, "[" v "]")) { found = 1; next } }
             found { print }' changelog.md > notes.md || true
-          test -s notes.md || echo "Radiante ${{ needs.version.outputs.mod }}" > notes.md
+          test -s notes.md || echo "Radiante (Luna Fork) ${{ needs.version.outputs.mod }}" > notes.md
           ls dist/radiante-${{ matrix.loader }}-*.jar
       - uses: Kir-Antipov/mc-publish@v3.3.1
         with:
@@ -233,7 +233,7 @@ jobs:
           curseforge-id: ${{ vars.CURSEFORGE_ID }}
           curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
           files: dist/radiante-${{ matrix.loader }}-*.jar
-          name: Radiante ${{ needs.version.outputs.mod }} (${{ matrix.name }})
+          name: Radiante (Luna Fork) ${{ needs.version.outputs.mod }} (${{ matrix.name }})
           version: ${{ needs.version.outputs.mod }}+${{ matrix.loader }}
           version-type: beta
           loaders: ${{ matrix.loader }}

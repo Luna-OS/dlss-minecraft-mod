@@ -1,23 +1,27 @@
 {
   "schemaVersion": 1,
-  "id": "radiante",
+  "id": "radiante-luna",
+  "provides": [
+    "radiante"
+  ],
   "version": "${version}",
-  "name": "Radiante",
-  "description": "Hardware ray-traced renderer with DLSS, FSR and XeSS running on Minecraft's native Vulkan backend.",
+  "name": "Radiante (Luna Fork)",
+  "description": "Fork of Radiante (by Gabrieli2806) focused on compatibility with other mods. Hardware ray-traced renderer with DLSS, FSR and XeSS running on Minecraft's native Vulkan backend.",
   "authors": [
     "Gabrieli2806"
   ],
   "contributors": [
     "LJIONG",
     "Interstellarss",
-    "CaSilicate-dev"
+    "CaSilicate-dev",
+    "Luna (fork maintainer)"
   ],
   "license": "GPL-3.0",
   "icon": "assets/radiante/icon.png",
   "contact": {
-    "homepage": "https://modrinth.com/project/radiante",
-    "sources": "https://github.com/Gabrieli2806/Radiante-26.3-Fabric",
-    "issues": "https://github.com/Gabrieli2806/Radiante-26.3-Fabric/issues"
+    "homepage": "https://github.com/Luna-OS/dlss-minecraft-mod",
+    "sources": "https://github.com/Luna-OS/dlss-minecraft-mod",
+    "issues": "https://github.com/Luna-OS/dlss-minecraft-mod/issues"
   },
   "environment": "client",
   "entrypoints": {
