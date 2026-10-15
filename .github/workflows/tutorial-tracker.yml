@@ -1,0 +1,42 @@
+# Builds the Tutorial Tracker mod (tutorial-tracker/) for Fabric, NeoForge and Forge and keeps the jars as an artifact.
+name: Tutorial Tracker
+
+on:
+  push:
+    paths: ['tutorial-tracker/**', '.github/workflows/tutorial-tracker.yml']
+  pull_request:
+    paths: ['tutorial-tracker/**', '.github/workflows/tutorial-tracker.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: tutorial-tracker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: tutorial-tracker
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Build jars
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon
+      - name: Collect
+        run: |
+          mkdir dist
+          cp fabric/build/libs/tutorial-tracker-*.jar neoforge/build/libs/tutorial-tracker-*.jar \
+            forge/build/libs/tutorial-tracker-*.jar dist/
+          ls -la dist
+          test "$(ls dist | wc -l)" -eq 3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tutorial-tracker-jars
+          path: tutorial-tracker/dist/*.jar

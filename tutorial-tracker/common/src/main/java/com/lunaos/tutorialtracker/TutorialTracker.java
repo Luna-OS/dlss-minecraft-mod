@@ -112,8 +112,11 @@ public final class TutorialTracker {
                 project.name = tutorial.title();
             }
             MaterialParser.Result result = new MaterialParser(ItemNameIndex.get()).parse(tutorial.text());
-            project.setMaterials(result.items());
-            project.unmatched = result.unmatched();
+            // Loading the same link again refreshes the list, but a page without one leaves it as it was.
+            if (!result.items().isEmpty() || project.materials.isEmpty()) {
+                project.setMaterials(result.items());
+                project.unmatched = result.unmatched();
+            }
             project.videoPosition = 0;
             saveProject(project);
             ContainerTracker.recount();

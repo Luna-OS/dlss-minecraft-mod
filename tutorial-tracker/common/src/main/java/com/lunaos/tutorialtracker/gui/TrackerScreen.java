@@ -8,6 +8,7 @@ import com.lunaos.tutorialtracker.project.Project;
 import com.lunaos.tutorialtracker.video.VideoPlayer;
 import java.util.ArrayList;
 import java.util.List;
+import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
@@ -15,6 +16,7 @@ import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.ConfirmScreen;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.util.FormattedCharSequence;
@@ -340,6 +342,17 @@ public class TrackerScreen extends Screen {
 
     private int maxScroll() {
         return Math.max(0, materials().size() * ROW - this.listHeight);
+    }
+
+    @Override
+    public boolean keyPressed(KeyEvent event) {
+        // Enter in the link field loads it.
+        if (this.getFocused() == this.urlBox
+            && (event.key() == InputConstants.KEY_RETURN || event.key() == InputConstants.KEY_NUMPADENTER)) {
+            load();
+            return true;
+        }
+        return super.keyPressed(event);
     }
 
     @Override

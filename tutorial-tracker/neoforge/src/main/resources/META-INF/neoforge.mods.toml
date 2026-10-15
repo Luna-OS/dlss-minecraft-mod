@@ -8,7 +8,7 @@ modId = "tutorialtracker"
 version = "${version}"
 displayName = "Tutorial Tracker"
 authors = "Luna"
-logoFile = "assets/tutorialtracker/icon.png"
+iconFile = "assets/tutorialtracker/icon.png"
 description = '''Paste a build tutorial link: get its material list, count what is in the chests and shulker boxes you assign, and watch the video in game while building. Client side only.'''
 
 [[dependencies.tutorialtracker]]

@@ -14,6 +14,8 @@ import net.minecraft.network.chat.Component;
 public class SettingsScreen extends Screen {
 
     private final Screen parent;
+    private int panelY;
+    private int panelHeight;
 
     public SettingsScreen(Screen parent) {
         super(Component.translatable("screen.tutorialtracker.settings"));
@@ -30,7 +32,10 @@ public class SettingsScreen extends Screen {
         int width = 150;
         int left = this.width / 2 - width - 2;
         int right = this.width / 2 + 2;
-        int y = 30;
+        // The window fits its contents, centred: title, five rows of options, the tools button and "Done".
+        this.panelHeight = 22 + 5 * 24 + 6 + 24 + 6 + 28;
+        this.panelY = Math.max(4, (this.height - this.panelHeight) / 2);
+        int y = this.panelY + 22;
 
         option(left, y, () -> Component.translatable("settings.tutorialtracker.hud", onOff(config.hudVisible)),
             b -> config.hudVisible = !config.hudVisible);
@@ -70,7 +75,7 @@ public class SettingsScreen extends Screen {
                 b -> this.minecraft.gui.setScreen(new ToolsScreen(this)))
             .bounds(left, y, width * 2 + 4, 20).build());
         this.addRenderableWidget(Button.builder(Component.translatable("gui.done"), b -> this.onClose())
-            .bounds(this.width / 2 - 100, this.height - 32, 200, 20).build());
+            .bounds(this.width / 2 - 100, y + 30, 200, 20).build());
     }
 
     private void option(int x, int y, Supplier<Component> label, Consumer<Button> change) {
@@ -84,12 +89,12 @@ public class SettingsScreen extends Screen {
     @Override
     public void extractBackground(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float a) {
         super.extractBackground(graphics, mouseX, mouseY, a);
-        McStyle.panel(graphics, this.width / 2 - 162, 4, 324, this.height - 8);
+        McStyle.panel(graphics, this.width / 2 - 162, this.panelY, 324, this.panelHeight);
     }
 
     @Override
     public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float a) {
-        McStyle.label(graphics, this.font, this.title, this.width / 2 - 152, 12);
+        McStyle.label(graphics, this.font, this.title, this.width / 2 - 152, this.panelY + 8);
         super.extractRenderState(graphics, mouseX, mouseY, a);
     }
 

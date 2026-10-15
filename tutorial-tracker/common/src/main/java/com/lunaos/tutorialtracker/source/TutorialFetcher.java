@@ -107,6 +107,12 @@ public final class TutorialFetcher {
 
     private static Tutorial fetchPage(String url) throws IOException, InterruptedException {
         String html = get(url);
+        if (html == null) {
+            // Not a page (a video file, say): nothing to read a list from, but it can still be played.
+            String path = URI.create(url).getPath();
+            String name = path == null ? url : path.substring(path.lastIndexOf('/') + 1);
+            return new Tutorial(name, "", null);
+        }
         String title = "";
         Matcher titleMatch = Pattern.compile("(?is)<title[^>]*>(.*?)</title>").matcher(html);
         if (titleMatch.find()) {
@@ -115,6 +121,10 @@ public final class TutorialFetcher {
         return new Tutorial(title, htmlToText(html), null);
     }
 
+    /** Pages larger than this are cut off: a material list is never that far down. */
+    private static final int MAX_PAGE_BYTES = 8 << 20;
+
+    /** The page as text, or null when the link is not a text page at all. */
     private static String get(String url) throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
             .timeout(Duration.ofSeconds(30))
@@ -124,18 +134,24 @@ public final class TutorialFetcher {
             .header("Cookie", "SOCS=CAI; CONSENT=YES+cb")
             .GET()
             .build();
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        if (response.uri().getHost() != null && response.uri().getHost().endsWith("google.com")
-            && response.uri().getPath().startsWith("/sorry")) {
-            throw new IOException(BLOCKED);
+        HttpResponse<java.io.InputStream> response = HTTP.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        try (java.io.InputStream body = response.body()) {
+            if (response.uri().getHost() != null && response.uri().getHost().endsWith("google.com")
+                && response.uri().getPath().startsWith("/sorry")) {
+                throw new IOException(BLOCKED);
+            }
+            if (response.statusCode() == 429) {
+                throw new IOException(BLOCKED);
+            }
+            if (response.statusCode() >= 400) {
+                throw new IOException("HTTP " + response.statusCode());
+            }
+            String type = response.headers().firstValue("Content-Type").orElse("text/html").toLowerCase(java.util.Locale.ROOT);
+            if (!type.startsWith("text/") && !type.contains("html") && !type.contains("xml") && !type.contains("json")) {
+                return null;
+            }
+            return new String(body.readNBytes(MAX_PAGE_BYTES), StandardCharsets.UTF_8);
         }
-        if (response.statusCode() == 429) {
-            throw new IOException(BLOCKED);
-        }
-        if (response.statusCode() >= 400) {
-            throw new IOException("HTTP " + response.statusCode());
-        }
-        return response.body();
     }
 
     /** The JSON object assigned to {@code name} in a page's script, found by matching its braces. */

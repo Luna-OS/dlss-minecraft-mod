@@ -5,8 +5,10 @@ name: Build
 on:
   push:
     branches: [main, 'mc/**']
-    paths-ignore: ['**.md', 'docs/**', 'screenshots/**']
+    paths-ignore: ['**.md', 'docs/**', 'screenshots/**', 'tutorial-tracker/**']
+  # The Tutorial Tracker mod has a workflow of its own (tutorial-tracker.yml).
   pull_request:
+    paths-ignore: ['tutorial-tracker/**', '.github/workflows/tutorial-tracker.yml']
   workflow_dispatch:
 
 concurrency:
